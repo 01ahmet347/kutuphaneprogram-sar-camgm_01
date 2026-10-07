@@ -7,13 +7,15 @@ import {
   generateStudentCredential
 } from '../server/student-registration.js';
 
-// Kayıt davranışını değiştirmeden hata ayrıntısını sunucuya kaydeder.
+// Kayıt hatasının ayrıntısını yalnızca sunucu loglarına yazar.
 function registrationDiagnostic(stage, action) {
   return async (...args) => {
     try {
       return await action(...args);
     } catch (error) {
-      const message = String(error?.message || 'Hata mesajı bulunamadı.')
+      const message = String(
+        error?.message || 'Hata mesajı bulunamadı.'
+      )
         .replace(
           /-----BEGIN[\s\S]*?-----END[^\r\n]*-----/g,
           '[GİZLİ ANAHTAR]'
@@ -88,7 +90,6 @@ const handler = createStudentRegistrationHandler({
         const snapshot = await tx.get(ref);
         const previous = snapshot.data() || {};
         const windowStart = Number(previous.windowStart || 0);
-
         const attempts =
           windowStart > at - 60 * 60 * 1000
             ? Number(previous.attempts || 0) + 1
@@ -138,7 +139,10 @@ const handler = createStudentRegistrationHandler({
               tx.get(userRef)
             ]);
 
-            if (codeSnap.exists() || userSnap.exists()) return false;
+            // Admin SDK'da exists bir özelliktir; parantez kullanılmaz.
+            if (codeSnap.exists || userSnap.exists) {
+              return false;
+            }
 
             tx.create(codeRef, {
               userId: uid,
@@ -156,11 +160,16 @@ const handler = createStudentRegistrationHandler({
 
         return {
           user: profile,
-          credentials: { specialCode, pin }
+          credentials: {
+            specialCode,
+            pin
+          }
         };
       }
 
-      throw new Error('Unable to allocate unique student credentials.');
+      throw new Error(
+        'Unable to allocate unique student credentials.'
+      );
     }
   )
 });
