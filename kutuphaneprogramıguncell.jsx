@@ -816,6 +816,8 @@ function MainApp() {
   
   const settingsRef = useRef(settings);
   const [registrationLinkSaving, setRegistrationLinkSaving] = useState(false);
+  const [systemSettingsSaving, setSystemSettingsSaving] = useState(false);
+  const systemSettingsSavingRef = useRef(false);
   const [registrationRedirectBusy, setRegistrationRedirectBusy] = useState(false);
   const registrationRedirectInFlightRef = useRef(false);
   useEffect(() => { settingsRef.current = settings; }, [settings]);
@@ -2137,7 +2139,8 @@ function MainApp() {
               granularBaselineRef.current.settings !== stableJson(settingsRef.current);
             granularBaselineRef.current.settings = remoteJson;
             granularSeenRemoteRef.current.settings = true;
-            if (!localChanged) {
+            // Öğrenci cihazında yerel ayar farkları sunucudaki yeni saatleri engellemesin.
+            if (!adminDataMode || !localChanged) {
               settingsRef.current = remote;
               setSettings(remote);
             }
@@ -7355,8 +7358,12 @@ function MainApp() {
               {adminTab === 'settings' && (
                 <div className="max-w-2xl mx-auto bg-white p-8 rounded-2xl shadow-sm border border-slate-200">
                   <h2 className="text-xl font-bold text-slate-800 mb-6 flex items-center gap-2"><Settings className="text-blue-600"/> Sistem Ayarları</h2>
-                  <form onSubmit={(e) => {
+                  <form onSubmit={async (e) => {
                      e.preventDefault();
+                     if (systemSettingsSavingRef.current) return;
+                     if (!db || !fbUser || !adminAuthorized || navigator.onLine === false) {
+                       return showMessage('Ayarlar Kaydedilemedi', 'Sunucu bağlantısını kontrol edip tekrar deneyin. Saatlerin öğrencilere yansıması için sunucu kaydı gereklidir.', 'warning');
+                     }
                      pushUndoSnapshot('Sistem ayarlarını kaydetme');
                      const formData = new FormData(e.target);
                      const previousOpenTime = String(settings.openTime || DEFAULT_SETTINGS.openTime);
@@ -7364,8 +7371,7 @@ function MainApp() {
                      const nextOpenTime = String(formData.get('openTime') || DEFAULT_SETTINGS.openTime);
                      const nextCloseTime = String(formData.get('closeTime') || DEFAULT_SETTINGS.closeTime);
 
-                     setSettings(prev => ({
-                        ...prev,
+                     const settingsPatch = {
                         openTime: nextOpenTime,
                         closeTime: nextCloseTime,
                         shortBreakCount: parseInt(formData.get('shortBreakCount')),
@@ -7377,7 +7383,31 @@ function MainApp() {
                         strikeLimit: Number.isFinite(parseInt(formData.get('strikeLimit'))) && parseInt(formData.get('strikeLimit')) > 0 ? parseInt(formData.get('strikeLimit')) : DEFAULT_SETTINGS.strikeLimit,
                         reportsEnabled: formData.get('reportsEnabled') === 'on',
                         useCustomLayout: formData.get('useCustomLayout') === 'on'
-                     }));
+                     };
+
+                     systemSettingsSavingRef.current = true;
+                     setSystemSettingsSaving(true);
+                     try {
+                       // Bekleyen eski yazıları tamamla; yeni ayarları gecikmeden sunucuya yaz.
+                       if (granularWriteTimerRef.current) {
+                         clearTimeout(granularWriteTimerRef.current);
+                         granularWriteTimerRef.current = null;
+                       }
+                       const save = granularWriteChainRef.current.catch(() => {}).then(async () => {
+                         const ref = getLiveSettingsDoc();
+                         const next = await runTransaction(db, async tx => {
+                           const snap = await tx.get(ref);
+                           const base = snap.exists() ? { ...DEFAULT_SETTINGS, ...snap.data() } : settingsRef.current;
+                           tx.set(ref, settingsPatch, { merge: true });
+                           return { ...base, ...settingsPatch };
+                         });
+                         granularBaselineRef.current.settings = stableJson(next);
+                         settingsRef.current = next;
+                         setSettings(next);
+                         return next;
+                       });
+                       granularWriteChainRef.current = save.catch(() => {});
+                       await save;
 
                      // Çalışma saatlerindeki değişiklikleri sistem kayıtlarına ayrıca yaz.
                      if (previousCloseTime !== nextCloseTime) {
@@ -7404,7 +7434,14 @@ function MainApp() {
                        );
                      }
 
-                     showMessage("Başarılı", "Sistem ayarları güncellendi. Kapanış bildirimleri güncel saate göre otomatik planlandı.", "success");
+                     showMessage("Başarılı", "Sistem ayarları sunucuya kaydedildi. Öğrenci ekranları güncel saatleri anlık alacaktır.", "success");
+                     } catch (error) {
+                       handleFirestoreQuotaError(error);
+                       showMessage('Ayarlar Kaydedilemedi', 'Ayarlar sunucuya kaydedilemedi. İnternet bağlantısını ve sunucu izinlerini kontrol edip tekrar deneyin.', 'warning');
+                     } finally {
+                       systemSettingsSavingRef.current = false;
+                       setSystemSettingsSaving(false);
+                     }
                   }} className="space-y-6">
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                       <div>
@@ -7457,7 +7494,7 @@ function MainApp() {
                         </label>
                     </div>
 
-                    <button type="submit" className="w-full bg-slate-800 text-white font-bold py-4 rounded-xl shadow-md hover:bg-slate-900 transition-colors">Ayarları Kaydet</button>
+                    <button type="submit" disabled={systemSettingsSaving} className="w-full bg-slate-800 text-white font-bold py-4 rounded-xl shadow-md hover:bg-slate-900 transition-colors disabled:opacity-50">{systemSettingsSaving ? 'Kaydediliyor…' : 'Ayarları Kaydet'}</button>
                   </form>
                 </div>
               )}
