@@ -238,6 +238,21 @@ const normalizeDeskQrRows = rows => (Array.isArray(rows) ? rows : [])
     qrCode: desk.qrCode || ('QR-' + Number(desk.id) + '-SGM' + legacyIdentity(Number(desk.id)))
   }));
 
+// Ana Salonun 35 masasını tamamlar; mevcut oturumlar ve QR kodları korunur.
+const completeMainLibraryDesks = (rows, qrFallbackRows = []) => {
+  const byId = new Map((Array.isArray(rows) ? rows : [])
+    .filter(d => d && Number.isInteger(Number(d.id)) && Number(d.id) >= 1 && Number(d.id) <= 35)
+    .map(d => [Number(d.id), d]));
+  const qrById = new Map((Array.isArray(qrFallbackRows) ? qrFallbackRows : [])
+    .filter(d => d && d.qrCode).map(d => [Number(d.id), d.qrCode]));
+  return normalizeDeskQrRows(INITIAL_DESKS.map(defaultDesk => {
+    const current = byId.get(defaultDesk.id);
+    // Eski kayıtlardan yalnızca QR kurtarılır; eski dolu oturumlar yeniden açılmaz.
+    return { ...(current || defaultDesk), id: defaultDesk.id,
+      qrCode: current?.qrCode || qrById.get(defaultDesk.id) || '' };
+  }));
+};
+
 const normalizeIdentityUsers = (rows) => {
   const assigned=new Map();const used=new Set();
   for(const u of [...rows].sort((a,b)=>String(a.id).localeCompare(String(b.id)))) {
@@ -1803,6 +1818,7 @@ function MainApp() {
   const deskQrRepairInFlightRef = useRef(false);
   const deskQrAutoRecoveryAttemptedRef = useRef(false);
   const [deskQrRepairBusy, setDeskQrRepairBusy] = useState(false);
+  const [usersSyncError, setUsersSyncError] = useState('');
 
   const stableJson = value => {
     try { return JSON.stringify(value); } catch { return ''; }
@@ -1976,28 +1992,28 @@ function MainApp() {
 
   const repairDeskQrData = async (notify = true) => {
     if (deskQrRepairInFlightRef.current) return;
-    if (db && !fbUser) {
-      if (notify) showMessage('Bağlantı Bekleniyor', 'Masa onarımı için sistem bağlantısını bekleyin.', 'warning');
+    if (db && (!fbUser || !adminAuthorized)) {
+      if (notify) showMessage('Bağlantı Bekleniyor', 'Masa onarımı için yönetici bağlantısını bekleyin.', 'warning');
       return;
     }
     deskQrRepairInFlightRef.current = true;
     setDeskQrRepairBusy(true);
     try {
       let rows = Array.isArray(desksRef.current) ? desksRef.current : [];
+      let qrFallbackRows = [...rows];
       if (db && fbUser) {
         if (Date.now() < Number(quotaBackoffUntilRef.current || 0)) throw new Error('Senkronizasyon kotası dolu. Birkaç dakika sonra tekrar deneyin.');
         const live = await getDocs(getLiveCollection('sgmDesks'));
         const remote = live.docs.map(snap => ({ ...snap.data(), id: snap.data()?.id ?? snap.id }));
-        if (remote.length) {
-          rows = remote;
-        } else {
+        rows = remote;
+        const valid = remote.filter(d => Number.isInteger(Number(d.id)) && Number(d.id) >= 1 && Number(d.id) <= 35);
+        if (new Set(valid.map(d => Number(d.id))).size < 35 || valid.some(d => !d.qrCode)) {
           const legacy = await getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'sgmData', 'allData'));
           const legacyRows = legacy.exists() ? legacy.data()?.desks : null;
-          if (Array.isArray(legacyRows) && legacyRows.length) rows = legacyRows;
+          if (Array.isArray(legacyRows)) qrFallbackRows.push(...legacyRows);
         }
       }
-      if (!rows.length) rows = INITIAL_DESKS;
-      const repaired = normalizeDeskQrRows(rows).filter(d => Number(d.id) <= 35);
+      const repaired = completeMainLibraryDesks(rows, qrFallbackRows);
       if (!repaired.length) throw new Error('Ana Salon için geçerli masa kaydı bulunamadı.');
       let finalRows = repaired;
       if (db && fbUser) {
@@ -2006,7 +2022,7 @@ function MainApp() {
           const snap = await tx.get(ref);
           if (snap.exists()) {
             const current = { ...snap.data(), id: Number(desk.id) };
-            const completed = normalizeDeskQrRows([current])[0];
+            const completed = normalizeDeskQrRows([{ ...current, qrCode: current.qrCode || desk.qrCode }])[0];
             if (!current.qrCode) tx.set(ref, { qrCode: completed.qrCode }, { merge: true });
             return completed;
           }
@@ -2014,6 +2030,8 @@ function MainApp() {
           return desk;
         })));
       }
+      finalRows.sort((a, b) => Number(a.id) - Number(b.id));
+      if (db && fbUser) granularBaselineRef.current.desks = rowsToMap(finalRows);
       desksRef.current = finalRows;
       setDesks(finalRows);
       localStorage.setItem('sgm_desks', JSON.stringify(finalRows));
@@ -2084,8 +2102,38 @@ function MainApp() {
       if (!retryTimer && !cancelled) retryTimer = setTimeout(() => setSyncRetryEpoch(value => value + 1), delay);
     };
 
+    // Yeni öğrenci kayıtları, eski veri aktarımının sonucunu beklemeden dinlenir.
+    setUsersSyncError('');
+    const userSource = adminDataMode ? getLiveCollection('sgmUsers') : getLiveDoc('sgmUsers', fbUser.uid);
+    unsubs.push(onSnapshot(userSource, { includeMetadataChanges: true }, snapshot => {
+      if (cancelled || snapshot.metadata.fromCache) return;
+      setUsersSyncError('');
+      if (adminDataMode) {
+        const remoteRows = snapshot.docs.map(d => ({ ...d.data(), id: d.id }));
+        const normalized = normalizeRemoteUsers(remoteRows, settingsRef.current);
+        const merged = mergeRemoteWithPendingLocal('users', normalized, usersRef.current);
+        usersRef.current = merged;
+        setUsers(merged);
+      } else {
+        const rows = snapshot.exists()
+          ? normalizeRemoteUsers([{ ...snapshot.data(), id: snapshot.id }], settingsRef.current) : [];
+        usersRef.current = rows;
+        setUsers(rows);
+        if (rows[0]) granularBaselineRef.current.users.set(String(rows[0].id), rows[0]);
+      }
+      markGranularLoaded('users');
+    }, error => {
+      if (cancelled) return;
+      setUsersSyncError(/permission-denied/.test(String(error?.code))
+        ? 'Kullanıcı listesine erişim reddedildi. Yönetici oturumunu ve Firestore kurallarını kontrol edin.'
+        : 'Kullanıcı listesi sunucudan alınamadı. Bağlantı kurulduğunda yeniden denenecek.');
+      retry(error);
+      setIsDataLoaded(true);
+    }));
+
     const setupGranularSync = async () => {
       try {
+        try {
         // Yeni parçalı yapının var olup olmadığını sadece settings belgesiyle kontrol ediyoruz.
         // Yoksa eski allData bir kez okunup yeni koleksiyonlara taşınıyor.
         const liveSettingsSnap = await getDoc(getLiveSettingsDoc());
@@ -2127,6 +2175,12 @@ function MainApp() {
               await setDoc(getLiveMetaDoc(), { historyMigrationVersion: 1 }, { merge: true });
             }
           }
+        }
+        if (cancelled) return;
+
+        } catch (migrationError) {
+          // Eski arşiv/meta izin hatası canlı masa ve kullanıcı dinlemesini durdurmasın.
+          retry(migrationError);
         }
         if (cancelled) return;
 
@@ -2175,14 +2229,17 @@ function MainApp() {
             if (snapshot.metadata.fromCache) return;
             let remoteRows = snapshot.docs.map(d => ({ ...d.data(), id: d.data()?.id ?? d.id }));
             remoteRows = normalizeRows(remoteRows);
-            // Boş önbellek / eksik koleksiyon krokideki mevcut masaları silmesin.
-            if (key === 'desks' && remoteRows.length === 0) {
-              if (!snapshot.metadata.fromCache && adminDataMode && !deskQrAutoRecoveryAttemptedRef.current) {
+            // Kısmen oluşmuş koleksiyonda da eksik 35 masa ve QR kayıtları tamamlanır.
+            if (key === 'desks') {
+              const needsRepair = new Set(remoteRows.map(d => Number(d.id))).size < 35 || remoteRows.some(d => !d.qrCode);
+              if (needsRepair && adminDataMode && !deskQrAutoRecoveryAttemptedRef.current) {
                 deskQrAutoRecoveryAttemptedRef.current = true;
                 repairDeskQrData(false);
               }
-              markGranularLoaded(key);
-              return;
+              if (remoteRows.length === 0) {
+                markGranularLoaded(key);
+                return;
+              }
             }
             if (key === 'users') remoteRows = normalizeRemoteUsers(remoteRows, settingsRef.current);
             const mergedRows = ['desks', 'users'].includes(key)
@@ -2200,29 +2257,6 @@ function MainApp() {
           desksRef.current = rows;
           setDesks(rows);
         }, normalizeRemoteDesks);
-
-        if (adminDataMode) {
-          subscribeRows('sgmUsers', 'users', () => usersRef.current, rows => {
-            const normalized = normalizeRemoteUsers(rows, settingsRef.current);
-            usersRef.current = normalized;
-            setUsers(normalized);
-          });
-        } else {
-          const unsubscribe = onSnapshot(getLiveDoc('sgmUsers', fbUser.uid), snapshot => {
-            if (snapshot.metadata.fromCache) return;
-            if (snapshot.exists()) {
-              const user = normalizeRemoteUsers([{ ...snapshot.data(), id: snapshot.data()?.id ?? snapshot.id }], settingsRef.current)[0];
-              usersRef.current = [user];
-              setUsers([user]);
-              granularBaselineRef.current.users.set(String(user.id), user);
-            } else {
-              usersRef.current = [];
-              setUsers([]);
-            }
-            markGranularLoaded('users');
-          }, error => { retry(error); setIsDataLoaded(true); });
-          unsubs.push(unsubscribe);
-        }
 
         // Kota optimizasyonu: öğrenci cihazları yönetim arşivlerini gerçek zamanlı dinlemez.
         // Log / ihlal / geri bildirim koleksiyonları yalnızca yönetici paneli açıkken dinlenir.
@@ -7308,6 +7342,7 @@ function MainApp() {
 
               {adminTab === 'users' && (
                 <div className="space-y-6">
+                  {usersSyncError && <div role="alert" className="bg-amber-50 border border-amber-200 text-amber-800 p-4 rounded-xl">{usersSyncError}</div>}
                   {(!app && !db) && <div className="bg-orange-50 border border-orange-200 text-orange-800 p-4 rounded-xl"><b>Veritabanı Bağlantısı Yok:</b> Sistem şu an yerel modda çalışıyor.</div>}
                   <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 space-y-5">
                     <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
