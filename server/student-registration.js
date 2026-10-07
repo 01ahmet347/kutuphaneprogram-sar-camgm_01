@@ -1,8 +1,13 @@
 import { randomInt, randomUUID } from 'node:crypto';
 
-export function createStudentRegistrationHandler({ verifyAnonymousUser, isRateLimited, createStudent }) {
+export function createStudentRegistrationHandler({
+  verifyAnonymousUser,
+  isRateLimited,
+  createStudent
+}) {
   return async function studentRegistrationHandler(req, res) {
     res.setHeader('Cache-Control', 'no-store');
+
     if (req.method !== 'POST') {
       res.setHeader('Allow', 'POST');
       return res.status(405).json({ ok: false });
@@ -10,31 +15,62 @@ export function createStudentRegistrationHandler({ verifyAnonymousUser, isRateLi
 
     try {
       const uid = await verifyAnonymousUser(req);
-      if (!uid) return res.status(401).json({ ok: false, error: 'unauthenticated' });
+
+      if (!uid) {
+        return res.status(401).json({
+          ok: false,
+          error: 'unauthenticated'
+        });
+      }
+
       if (await isRateLimited?.(req)) {
-        return res.status(429).json({ ok: false, error: 'too_many_attempts', message: 'Kısa sürede çok fazla kayıt denemesi yapıldı. Daha sonra tekrar deneyin.' });
+        return res.status(429).json({
+          ok: false,
+          error: 'too_many_attempts',
+          message:
+            'Kısa sürede çok fazla kayıt denemesi yapıldı. Daha sonra tekrar deneyin.'
+        });
       }
 
       const created = await createStudent(uid);
+
       return res.status(201).json({
         ok: true,
         user: created.user,
         credentials: created.credentials
       });
     } catch (error) {
-      if (error.status) return res.status(error.status).json({ ok: false, error: error.code });
-      console.error('Student registration error:', error.code || 'unknown');
+      if (error.status) {
+        return res.status(error.status).json({
+          ok: false,
+          error: error.code
+        });
+      }
+
+      console.error(
+        'Student registration error:',
+        error.code || 'unknown'
+      );
+
       return res.status(503).json({
         ok: false,
         error: 'student_registration_unavailable',
-        message: 'Yeni öğrenci kaydı şu anda oluşturulamadı. Firebase sunucu ayarlarını kontrol edin.'
+        message:
+          'Yeni öğrenci kaydı şu anda oluşturulamadı. Firebase sunucu ayarlarını kontrol edin.'
       });
     }
   };
 }
 
-export function createStudentRecord({ uid, specialCode, pin, settings, now = Date.now() }) {
+export function createStudentRecord({
+  uid,
+  specialCode,
+  pin,
+  settings,
+  now = Date.now()
+}) {
   const registrationSession = randomUUID();
+
   return {
     id: uid,
     name: `Yeni Kayıt • ${specialCode}`,
@@ -45,7 +81,8 @@ export function createStudentRecord({ uid, specialCode, pin, settings, now = Dat
     registrationFormStatus: 'manual_review',
     pendingApproval: true,
     restrictedUntil: 0,
-    restrictionReason: 'Google Form kontrolü ve kütüphane sorumlusu onayı bekleniyor',
+    restrictionReason:
+      'Google Form kontrolü ve kütüphane sorumlusu onayı bekleniyor',
     activeDeskId: null,
     activeDeskRole: null,
     pendingDeskId: null,
