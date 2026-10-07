@@ -11,7 +11,7 @@
   },
   "dependencies": {
     "firebase": "^12.19.0",
-    "firebase-admin": "^14.3.0",
+    "firebase-admin": "^13.6.0",
     "lucide-react": "^0.468.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
