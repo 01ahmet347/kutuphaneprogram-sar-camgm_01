@@ -10,6 +10,33 @@ export function createCloudActions({ db, runTransaction, ref, settings, dayKey, 
     if (user.blocked || isRestricted(user, now())) throw new Error('Hesabınız kısıtlı.');
     return user;
   };
+  const requireExistingUser = (snap, deleted) => {
+    if (deleted.exists() || !snap.exists()) throw new Error('Bu kullanıcı hesabı silinmiş.');
+    return snap.data();
+  };
+  const refreshDailyFields = user => {
+    const today = dayKey();
+    let next = user;
+    if (user.breaksResetDate !== today) {
+      next = {
+        ...next,
+        breaks: {
+          short: Math.max(0, Number(settings().shortBreakCount) || 0),
+          long: Math.max(0, Number(settings().longBreakCount) || 0)
+        },
+        breaksResetDate: today
+      };
+    }
+    if (user.violationsResetDate !== today) {
+      next = {
+        ...next,
+        strikes: 0,
+        violationsResetDate: today,
+        dailyAccessVerifiedDate: user.dailyAccessVerifiedDate === today ? today : ''
+      };
+    }
+    return next;
+  };
   const checkDeskAccess = (user, id) => {
     if (lostDeskToday(user, id)) throw new Error('İhlal nedeniyle kaybettiğiniz masayı bugün tekrar alamazsınız.');
     if (Number(user.deskReclaimAllowedAt || 0) > now()) throw new Error('Masa bırakma sonrası 30 dakikalık bekleme süreniz devam ediyor.');
@@ -21,7 +48,7 @@ export function createCloudActions({ db, runTransaction, ref, settings, dayKey, 
     const [uSnap, dSnap, tombstone, lockSnap] = await Promise.all([
       tx.get(userRef(userId)), tx.get(deskRef(deskId)), tx.get(deletedRef(userId)), tx.get(lockRef)
     ]);
-    const user = requireUser(uSnap, tombstone);
+    const user = refreshDailyFields(requireUser(uSnap, tombstone));
     checkDeskAccess(user, deskId);
     if (!dSnap.exists()) throw new Error('Masa bulunamadı.');
     const desk = dSnap.data();
@@ -42,6 +69,7 @@ export function createCloudActions({ db, runTransaction, ref, settings, dayKey, 
       throw new Error('Önce mevcut rezervasyonunuzu tamamlayın veya iptal edin.');
     }
     if (mode === 'claim' && desk.occupant === userId && desk.ownerDeviceId === deviceId && Number(user.activeDeskId) === Number(deskId)) {
+      if (json(user) !== json(uSnap.data())) tx.set(userRef(userId), user);
       return { desk, user, alreadyApplied: true };
     }
     if (desk.status !== 'available' || desk.occupant) throw new Error('Masa başka bir kullanıcı tarafından alındı.');
@@ -72,9 +100,190 @@ export function createCloudActions({ db, runTransaction, ref, settings, dayKey, 
   return {
     reserve: input => reserveOrClaim('reserve', input),
     claim: input => reserveOrClaim('claim', input),
+    startBreak: ({ userId, deskId, type }) => runTransaction(db, async tx => {
+      const [uSnap, dSnap, tombstone] = await Promise.all([
+        tx.get(userRef(userId)), tx.get(deskRef(deskId)), tx.get(deletedRef(userId))
+      ]);
+      const user = refreshDailyFields(requireUser(uSnap, tombstone));
+      if (!dSnap.exists()) throw new Error('Masa bulunamadı.');
+      const desk = dSnap.data(), at = now(), breakCount = Number(user.breaks?.[type] || 0);
+      if (Number(user.activeDeskId) !== Number(deskId) || desk.occupant !== userId || desk.status !== 'occupied') {
+        throw new Error('Mola başlatmak için masanızda aktif olmalısınız.');
+      }
+      if (!['short', 'long'].includes(type) || breakCount <= 0) throw new Error('Bu mola hakkınız tükenmiş.');
+      const requiredWorkMs = Math.max(30, Number(settings().breakCooldown) || 30) * 60 * 1000;
+      if (at - Number(user.lastActiveTime || 0) < requiredWorkMs) throw new Error('Mola kullanabilmek için gerekli aktif çalışma süresi dolmadı.');
+      const duration = Number(type === 'short' ? settings().shortBreakDuration : settings().longBreakDuration);
+      if (!Number.isFinite(duration) || duration < 1 || duration > 240) throw new Error('Mola süresi ayarı geçersiz.');
+      const nextDesk = { ...desk, status: 'on_break', breakEndTime: at + duration * 60 * 1000 };
+      const nextUser = { ...user, breaks: { ...user.breaks, [type]: breakCount - 1 } };
+      tx.set(deskRef(deskId), nextDesk);
+      tx.set(userRef(userId), nextUser);
+      return { desk: nextDesk, user: nextUser, at };
+    }),
+    endBreak: ({ userId, deskId, qrCode }) => runTransaction(db, async tx => {
+      const [uSnap, dSnap, tombstone] = await Promise.all([
+        tx.get(userRef(userId)), tx.get(deskRef(deskId)), tx.get(deletedRef(userId))
+      ]);
+      const user = refreshDailyFields(requireExistingUser(uSnap, tombstone));
+      if (!dSnap.exists()) throw new Error('Masa bulunamadı.');
+      const desk = dSnap.data();
+      if (Number(user.activeDeskId) !== Number(deskId) || desk.occupant !== userId ||
+          desk.status !== 'on_break' || Number(desk.breakEndTime || 0) <= now() || desk.qrCode !== qrCode) {
+        throw new Error('Moladan dönmek için kendi masanızın güncel QR kodunu okutmalısınız.');
+      }
+      const at = now();
+      const nextDesk = { ...desk, status: 'occupied', breakEndTime: null };
+      const nextUser = { ...user, lastActiveTime: at };
+      tx.set(deskRef(deskId), nextDesk);
+      tx.set(userRef(userId), nextUser);
+      return { desk: nextDesk, user: nextUser, at };
+    }),
+    reportDesk: ({ userId, deskId, targetUserId }) => runTransaction(db, async tx => {
+      const [reporterSnap, deskSnap, reporterDeleted, targetSnap, targetDeleted] = await Promise.all([
+        tx.get(userRef(userId)), tx.get(deskRef(deskId)), tx.get(deletedRef(userId)),
+        tx.get(userRef(targetUserId)), tx.get(deletedRef(targetUserId))
+      ]);
+      const reporter = requireUser(reporterSnap, reporterDeleted);
+      if (!settings().reportsEnabled || reporter.canReport === false) throw new Error('İhbar etme yetkiniz kapalıdır.');
+      if (!deskSnap.exists() || !targetSnap.exists() || targetDeleted.exists()) throw new Error('Masa veya hedef kullanıcı bulunamadı.');
+      const desk = deskSnap.data(), target = targetSnap.data(), at = now();
+      if (userId === targetUserId || desk.occupant !== targetUserId || desk.status !== 'occupied' ||
+          Number(reporter.activeDeskId || 0) === Number(deskId) ||
+          Number(target.activeDeskId || 0) !== Number(deskId)) {
+        throw new Error('Masa durumu değişti veya bu kullanıcı için ihbar uygun değil.');
+      }
+      const waitMinutes = Math.max(1, Number(settings().reportWaitTime) || 5);
+      const eventId = `report-${deskId}-${at}-${Math.random().toString(36).slice(2, 9)}`;
+      const nextDesk = {
+        ...desk,
+        status: 'reported',
+        reportIssuedAt: at,
+        reportVerifiedAt: null,
+        reportEndTime: at + waitMinutes * 60 * 1000
+      };
+      const event = {
+        id: eventId,
+        time: at,
+        type: 'İHBAR',
+        message: `Masa ${deskId} ana kullanıcısı masada bulunmadığı gerekçesiyle ihbar edildi. Bildiren: ${String(reporter.name || '')} (${String(reporter.specialCode || '')})`,
+        deskId: Number(deskId),
+        userId: targetUserId,
+        userInfo: `${String(target.name || '')}${target.specialCode ? ` (GM: ${target.specialCode})` : ''}`,
+        actorFirebaseUid: userId,
+        actorId: userId,
+        actorInfo: String(reporter.specialCode || 'Öğrenci'),
+        deviceInfo: String(reporter.deviceId || '')
+      };
+      tx.set(deskRef(deskId), nextDesk);
+      tx.create(ref('sgmAudit', eventId), event);
+      return { desk: nextDesk, user: target, eventId, at, waitMinutes };
+    }),
+    verifyPresence: ({ userId, deskId, qrCode }) => runTransaction(db, async tx => {
+      const [uSnap, dSnap, tombstone] = await Promise.all([
+        tx.get(userRef(userId)), tx.get(deskRef(deskId)), tx.get(deletedRef(userId))
+      ]);
+      const user = refreshDailyFields(requireExistingUser(uSnap, tombstone));
+      if (!dSnap.exists()) throw new Error('Masa bulunamadı.');
+      const desk = dSnap.data();
+      if (Number(user.activeDeskId) !== Number(deskId) || desk.occupant !== userId ||
+          desk.status !== 'reported' || Number(desk.reportEndTime || 0) <= now() || desk.qrCode !== qrCode) {
+        throw new Error('Yalnızca kendi ihbar edilmiş masanızı QR ile doğrulayabilirsiniz.');
+      }
+      const at = now();
+      const nextDesk = { ...desk, status: 'occupied', reportEndTime: null, reportVerifiedAt: at };
+      const nextUser = { ...user, lastActiveTime: at };
+      tx.set(deskRef(deskId), nextDesk);
+      tx.set(userRef(userId), nextUser);
+      return { desk: nextDesk, user: nextUser, at };
+    }),
+    leaveDesk: ({ userId, deskId }) => runTransaction(db, async tx => {
+      const [uSnap, dSnap, tombstone] = await Promise.all([
+        tx.get(userRef(userId)), tx.get(deskRef(deskId)), tx.get(deletedRef(userId))
+      ]);
+      const user = refreshDailyFields(requireExistingUser(uSnap, tombstone));
+      if (!dSnap.exists()) throw new Error('Masa bulunamadı.');
+      const desk = dSnap.data(), at = now();
+      if (Number(user.activeDeskId) !== Number(deskId) || desk.occupant !== userId) {
+        throw new Error('Aktif masa oturumunuz bulunamadı.');
+      }
+      if ((desk.status === 'on_break' && Number(desk.breakEndTime || 0) <= at) ||
+          (desk.status === 'reported' && Number(desk.reportEndTime || 0) <= at)) {
+        throw new Error('Süreniz dolduğu için masa otomatik işlem bekliyor. Biraz sonra durumu yenileyin.');
+      }
+      const pendingSnap = user.pendingDeskId && Number(user.pendingDeskId) !== Number(deskId)
+        ? await tx.get(deskRef(user.pendingDeskId))
+        : null;
+      let nextDesk, promotedUser = null;
+      if (desk.guestOccupant) {
+        const guestSnap = await tx.get(userRef(desk.guestOccupant));
+        promotedUser = guestSnap.exists() ? guestSnap.data() : null;
+        nextDesk = {
+          ...desk,
+          occupant: desk.guestOccupant,
+          ownerDeviceId: promotedUser?.deviceId || null,
+          sessionStartTime: desk.guestSessionStartTime || at,
+          status: 'occupied',
+          breakEndTime: null,
+          reportEndTime: null,
+          reportIssuedAt: null,
+          reportVerifiedAt: null,
+          guestOccupant: null,
+          guestSessionStartTime: null,
+          guestBreakEndTime: null,
+          guestReported: false,
+          guestReportEndTime: null,
+          guestReportIssuedAt: null,
+          guestReportVerifiedAt: null,
+          pendingOccupant: null,
+          pendingDeskRole: null,
+          pendingDeskDeadline: null,
+          pendingDeviceId: null
+        };
+      } else {
+        nextDesk = {
+          ...desk,
+          status: desk.status === 'disabled' ? 'disabled' : 'available',
+          occupant: null,
+          ownerDeviceId: null,
+          sessionStartTime: null,
+          breakEndTime: null,
+          reportEndTime: null,
+          reportIssuedAt: null,
+          reportVerifiedAt: null,
+          pendingOccupant: null,
+          pendingDeskRole: null,
+          pendingDeskDeadline: null,
+          pendingDeviceId: null
+        };
+      }
+      const nextUser = {
+        ...user,
+        activeDeskId: null,
+        activeDeskRole: null,
+        pendingDeskId: null,
+        pendingDeskDeadline: null,
+        lastActiveTime: at,
+        deskReleasedAt: at,
+        deskReclaimAllowedAt: at + 30 * 60 * 1000,
+        gmDeskAccessAt: at
+      };
+      tx.set(deskRef(deskId), nextDesk);
+      tx.set(userRef(userId), nextUser);
+      if (promotedUser) tx.set(userRef(desk.guestOccupant), {
+        ...promotedUser, activeDeskId: Number(deskId), activeDeskRole: 'owner', lastActiveTime: at
+      });
+      const changedDesks = [nextDesk];
+      if (pendingSnap?.exists() && pendingSnap.data().pendingOccupant === userId) {
+        const cleanPending = { ...pendingSnap.data(), pendingOccupant: null, pendingDeskRole: null, pendingDeskDeadline: null, pendingDeviceId: null };
+        tx.set(pendingSnap.ref, cleanPending);
+        changedDesks.push(cleanPending);
+      }
+      return { desk: nextDesk, user: nextUser, desks: changedDesks, at, mode: promotedUser ? 'owner_promoted_guest' : 'desk_empty' };
+    }),
     assign: ({ userId, deskId }) => runTransaction(db, async tx => {
       const [u, d, tombstone] = await Promise.all([tx.get(userRef(userId)), tx.get(deskRef(deskId)), tx.get(deletedRef(userId))]);
-      const user = requireUser(u, tombstone);
+      const user = refreshDailyFields(requireUser(u, tombstone));
       if (!d.exists()) throw new Error('Masa bulunamadı.');
       const desk = d.data(), at = now();
       if (desk.status !== 'available' || desk.occupant || desk.pendingOccupant && desk.pendingOccupant !== userId && Number(desk.pendingDeskDeadline) > at) throw new Error('Masa başka bir kullanıcı tarafından alındı veya rezerve edildi.');
@@ -136,7 +345,7 @@ export function createCloudActions({ db, runTransaction, ref, settings, dayKey, 
       }
       if (!mode || !userId) return null;
       const u = await tx.get(userRef(userId));
-      let nextDesk = releaseUserFromDesk(desk, userId), nextUser = u.exists() ? u.data() : null;
+      let nextDesk = releaseUserFromDesk(desk, userId), nextUser = u.exists() ? refreshDailyFields(u.data()) : null;
       // Reservation expiry must not release a different active owner.
       if (mode === 'reservation') {
         nextDesk = { ...desk, pendingOccupant: null, pendingDeskRole: null, pendingDeskDeadline: null, pendingDeviceId: null };
@@ -147,6 +356,32 @@ export function createCloudActions({ db, runTransaction, ref, settings, dayKey, 
       }
       tx.set(deskRef(deskId), nextDesk);
       if (nextUser && json(nextUser) !== json(u.data())) tx.set(userRef(userId), nextUser);
+      if (mode !== 'reservation') {
+        const message = `Masa ${deskId} ${mode === 'break_timeout' ? 'mola süresi aşıldığı' : 'ihbar QR ile doğrulanmadığı'} için boşaltıldı. Toplam ihlal: ${nextUser?.strikes || 0}`;
+        const userInfo = nextUser ? `${String(nextUser.name || '')}${nextUser.specialCode ? ` (GM: ${nextUser.specialCode})` : ''}` : 'Kullanıcı bulunamadı';
+        const audit = {
+          id: `timeout-${deskId}-${mode}-${deadline}`,
+          time: at,
+          type: 'IHLAL',
+          message,
+          deskId: Number(deskId),
+          userId,
+          userInfo,
+          actorId: 'SYSTEM',
+          actorInfo: 'Sistem / Anonim'
+        };
+        tx.set(ref('sgmAudit', audit.id), audit, { merge: true });
+        tx.set(ref('sgmViolations', `VIOL-${audit.id}`), {
+          id: `VIOL-${audit.id}`,
+          sourceLogId: audit.id,
+          time: at,
+          type: audit.type,
+          message: audit.message,
+          deskId: audit.deskId,
+          userId: audit.userId,
+          userInfo: audit.userInfo
+        }, { merge: true });
+      }
       return { desk: nextDesk, user: nextUser, mode, eventId: `timeout-${deskId}-${mode}-${deadline}`, at };
     })
   };

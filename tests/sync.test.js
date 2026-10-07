@@ -23,6 +23,7 @@ function memoryDatabase(seed = {}) {
           return { ref:key, exists:()=>view.has(key), data:()=>clone(value) };
         },
         set(key,value,options) { writing=true; pending.push({key,value:clone(value),merge:options?.merge}); },
+        create(key,value) { assert.equal(view.has(key),false,'Firestore create must target a missing document'); writing=true; pending.push({key,value:clone(value)}); },
         delete(key) { writing=true; pending.push({key,delete:true}); }
       };
       const result=await callback(tx);
@@ -41,7 +42,7 @@ function memoryDatabase(seed = {}) {
 const user = id => ({id,name:id,blocked:false,pendingApproval:false,strikes:0,restrictedUntil:0,activeDeskId:null,pendingDeskId:null,pendingDeskDeadline:null,violationHistory:[]});
 const desk = id => ({id,status:'available',occupant:null,ownerDeviceId:null,pendingOccupant:null,pendingDeskDeadline:null,qrCode:`QR-${id}-test`});
 function actions(db,clock=()=>1000) {
-  return createCloudActions({db,runTransaction:db.runTransaction,ref:db.ref,settings:()=>({strikeLimit:2}),dayKey:()=> '2026-10-07',
+  return createCloudActions({db,runTransaction:db.runTransaction,ref:db.ref,settings:()=>({strikeLimit:2,breakCooldown:30,shortBreakCount:5,longBreakCount:2,shortBreakDuration:15,longBreakDuration:60,reportsEnabled:true,reportWaitTime:5}),dayKey:()=> '2026-10-07',
     isRestricted:u=>u.pendingApproval||u.restrictedUntil>clock(),lostDeskToday:()=>false,now:clock,
     applyViolationPolicy:(u,id,at)=>({violationHistory:[...(u.violationHistory||[]),at],lostDeskIds:[id]})});
 }
@@ -91,6 +92,74 @@ test('QR claim validates reservation and writes user/desk together',async()=>{
   await assert.rejects(api.claim({userId:'a',deskId:1,deviceId:'A',qrCode:'wrong'}),/QR/);
   await api.claim({userId:'a',deskId:1,deviceId:'A',qrCode:'QR-1-test'});
   assert.equal(db.data.get('sgmDesks/1').occupant,'a');assert.equal(db.data.get('sgmUsers/a').activeDeskId,1);
+});
+test('break actions are verified and persisted with the desk and student together',async()=>{
+  const student={...user('a'),activeDeskId:1,lastActiveTime:-2000000,breaks:{short:1,long:1},breaksResetDate:'2026-10-07'};
+  const db=memoryDatabase({'sgmUsers/a':student,'sgmDesks/1':{...desk(1),status:'occupied',occupant:'a'}});
+  const api=actions(db);
+  await api.startBreak({userId:'a',deskId:1,type:'short'});
+  assert.equal(db.data.get('sgmDesks/1').status,'on_break');
+  assert.equal(db.data.get('sgmUsers/a').breaks.short,0);
+  await api.endBreak({userId:'a',deskId:1,qrCode:'QR-1-test'});
+  assert.equal(db.data.get('sgmDesks/1').status,'occupied');
+  assert.equal(db.data.get('sgmUsers/a').lastActiveTime,1000);
+});
+test('daily student limits reset on the server before a new break is started',async()=>{
+  const student={...user('a'),activeDeskId:1,lastActiveTime:-2000000,breaks:{short:0,long:0},breaksResetDate:'2026-10-06',strikes:2,violationsResetDate:'2026-10-06'};
+  const db=memoryDatabase({'sgmUsers/a':student,'sgmDesks/1':{...desk(1),status:'occupied',occupant:'a'}});
+  const api=actions(db);
+  await api.startBreak({userId:'a',deskId:1,type:'short'});
+  assert.equal(db.data.get('sgmUsers/a').breaks.short,4);
+  assert.equal(db.data.get('sgmUsers/a').strikes,0);
+  assert.equal(db.data.get('sgmUsers/a').breaksResetDate,'2026-10-07');
+  assert.equal(db.data.get('sgmUsers/a').violationsResetDate,'2026-10-07');
+});
+test('late QR return cannot bypass an expired break penalty',async()=>{
+  const db=memoryDatabase({
+    'sgmUsers/a':{...user('a'),activeDeskId:1},
+    'sgmDesks/1':{...desk(1),status:'on_break',occupant:'a',breakEndTime:900}
+  });
+  await assert.rejects(actions(db).endBreak({userId:'a',deskId:1,qrCode:'QR-1-test'}),/Moladan/);
+});
+test('student report and presence verification are transactional and scoped to authenticated students',async()=>{
+  const db=memoryDatabase({
+    'sgmUsers/reporter':{...user('reporter'),activeDeskId:2,canReport:true,name:'R'},
+    'sgmUsers/target':{...user('target'),activeDeskId:1,name:'T',specialCode:'12345678'},
+    'sgmDesks/1':{...desk(1),status:'occupied',occupant:'target'},
+    'sgmDesks/2':{...desk(2),status:'occupied',occupant:'reporter'}
+  });
+  test('late QR report verification cannot bypass an expired report penalty',async()=>{
+    const db=memoryDatabase({
+      'sgmUsers/a':{...user('a'),activeDeskId:1},
+      'sgmDesks/1':{...desk(1),status:'reported',occupant:'a',reportEndTime:900}
+    });
+    await assert.rejects(actions(db).verifyPresence({userId:'a',deskId:1,qrCode:'QR-1-test'}),/doğrulayabilirsiniz/);
+  });
+  test('leaving after break expiry cannot bypass the timeout transaction',async()=>{
+    const db=memoryDatabase({
+      'sgmUsers/a':{...user('a'),activeDeskId:1},
+      'sgmDesks/1':{...desk(1),status:'on_break',occupant:'a',breakEndTime:900}
+    });
+    await assert.rejects(actions(db).leaveDesk({userId:'a',deskId:1}),/otomatik işlem/);
+  });
+  const api=actions(db);
+  const report=await api.reportDesk({userId:'reporter',deskId:1,targetUserId:'target'});
+  assert.equal(report.desk.status,'reported');
+  assert.equal(db.data.get(`sgmAudit/${report.eventId}`).userId,'target');
+  assert.equal(db.data.get(`sgmAudit/${report.eventId}`).actorFirebaseUid,'reporter');
+  await api.verifyPresence({userId:'target',deskId:1,qrCode:'QR-1-test'});
+  assert.equal(db.data.get('sgmDesks/1').status,'occupied');
+  assert.equal(db.data.get('sgmUsers/target').lastActiveTime,1000);
+});
+test('student leave applies the server controlled cooldown',async()=>{
+  const db=memoryDatabase({
+    'sgmUsers/a':{...user('a'),activeDeskId:1,activeDeskRole:'owner'},
+    'sgmDesks/1':{...desk(1),status:'occupied',occupant:'a'}
+  });
+  const result=await actions(db).leaveDesk({userId:'a',deskId:1});
+  assert.equal(result.desk.status,'available');
+  assert.equal(db.data.get('sgmUsers/a').activeDeskId,null);
+  assert.equal(db.data.get('sgmUsers/a').deskReclaimAllowedAt,1801000);
 });
 test('a reservation past its deadline cannot be claimed',async()=>{
   let time=1000;const db=memoryDatabase({'sgmUsers/a':user('a'),'sgmDesks/1':desk(1)}),api=actions(db,()=>time);
@@ -148,7 +217,7 @@ function applicationAppend(db, online=true) {
  const source=readFileSync(new URL('../kutuphaneprogramıguncell.jsx',import.meta.url),'utf8');
  const a=source.indexOf('  const readAppendOutbox ='),b=source.indexOf('  const flushAuditOutbox =',a);
  const store=new Map();
- const context={db,fbUser:{uid:'test'},navigator:{onLine:online},quotaBackoffUntilRef:{current:0},appendOutboxRef:{current:null},getLiveDoc:db.ref,runTransaction:db.runTransaction,stableJson:JSON.stringify,isRecordDeleted:()=>false,localStorage:{getItem:key=>store.get(key)??null,setItem:(key,value)=>store.set(key,value),removeItem:key=>store.delete(key)},console};
+ const context={db,fbUser:{uid:'test'},adminAuthorized:true,navigator:{onLine:online},quotaBackoffUntilRef:{current:0},appendOutboxRef:{current:null},getLiveDoc:db.ref,runTransaction:db.runTransaction,stableJson:JSON.stringify,isRecordDeleted:()=>false,localStorage:{getItem:key=>store.get(key)??null,setItem:(key,value)=>store.set(key,value),removeItem:key=>store.delete(key)},console};
  vm.createContext(context);vm.runInContext(source.slice(a,b)+';globalThis.persist=persistAppendItem;globalThis.pending=readAppendOutbox;',context);
  return context;
 }

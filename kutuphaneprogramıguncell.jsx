@@ -1689,8 +1689,28 @@ function MainApp() {
     initAuth();
     const unsubscribe = onAuthStateChanged(auth, user => {
       setFbUser(user);
-      if (!user) setAdminAuthorized(false);
-      else user.getIdTokenResult().then(result => { if (!disposed) setAdminAuthorized(result.claims.admin === true); }).catch(() => { if (!disposed) setAdminAuthorized(false); });
+      if (!user) {
+        setAdminAuthorized(false);
+        usersRef.current = [];
+        setUsers([]);
+        localStorage.removeItem('sgm_users');
+      } else user.getIdTokenResult().then(result => {
+        if (disposed) return;
+        const isAdmin = result.claims.admin === true;
+        setAdminAuthorized(isAdmin);
+        if (!isAdmin) {
+          const ownUser = usersRef.current.find(row => String(row.id) === user.uid);
+          usersRef.current = ownUser ? [ownUser] : [];
+          setUsers(usersRef.current);
+          localStorage.setItem('sgm_users', JSON.stringify(usersRef.current));
+        }
+      }).catch(() => {
+        if (disposed) return;
+        setAdminAuthorized(false);
+        usersRef.current = [];
+        setUsers([]);
+        localStorage.removeItem('sgm_users');
+      });
     });
     return () => { disposed = true; clearTimeout(retryTimer); window.removeEventListener('online', resumeAuth); unsubscribe(); };
   }, []);
@@ -1710,6 +1730,35 @@ function MainApp() {
   const getLiveMetaDoc = () => getLiveDoc('sgmConfig', 'meta');
   const cloudActions = createCloudActions({ db, runTransaction, ref: getLiveDoc,
     settings: () => settingsRef.current, dayKey: getLocalDayKey, isRestricted, lostDeskToday, applyViolationPolicy });
+  const runStudentDeskAction = async (action, input = {}) => {
+    if (!fbUser) throw new Error('Öğrenci oturumu bulunamadı.');
+    const idToken = await fbUser.getIdToken();
+    const response = await fetch('/api/student-desk', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+      body: JSON.stringify({ action, ...input })
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok || payload?.ok !== true) {
+      throw new Error(payload?.message || `Masa servisi HTTP ${response.status} döndürdü.`);
+    }
+    if (payload.result === null) return null;
+    return payload;
+  };
+  const runStudentActivity = async (action, input = {}) => {
+    if (!fbUser) throw new Error('Öğrenci oturumu bulunamadı.');
+    const idToken = await fbUser.getIdToken();
+    const response = await fetch('/api/student-activity', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+      body: JSON.stringify({ action, ...input })
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok || payload?.ok !== true) {
+      throw new Error(payload?.message || `Öğrenci servisi HTTP ${response.status} döndürdü.`);
+    }
+    return payload.result;
+  };
   const applyCloudRows = ({ desk, user, desks: updatedDesks }) => {
     if (desk) updatedDesks = [desk];
     if (updatedDesks?.length) {
@@ -1887,6 +1936,7 @@ function MainApp() {
   const persistGranularStateNow = async snapshot => {
     if (!db || deskQrRepairInFlightRef.current) return;
     if (!fbUser || Date.now() < Number(quotaBackoffUntilRef.current || 0)) throw new Error('Sunucu bağlantısı veya kota bekleniyor. İşlem henüz sunucuya kaydedilmedi.');
+    if (!adminAuthorized) return;
 
     const jobs = [];
     if (snapshot.settings && adminAuthorized) {
@@ -2148,11 +2198,28 @@ function MainApp() {
           setDesks(rows);
         }, normalizeRemoteDesks);
 
-        subscribeRows('sgmUsers', 'users', () => usersRef.current, rows => {
-          const normalized = normalizeRemoteUsers(rows, settingsRef.current);
-          usersRef.current = normalized;
-          setUsers(normalized);
-        });
+        if (adminDataMode) {
+          subscribeRows('sgmUsers', 'users', () => usersRef.current, rows => {
+            const normalized = normalizeRemoteUsers(rows, settingsRef.current);
+            usersRef.current = normalized;
+            setUsers(normalized);
+          });
+        } else {
+          const unsubscribe = onSnapshot(getLiveDoc('sgmUsers', fbUser.uid), snapshot => {
+            if (snapshot.metadata.fromCache) return;
+            if (snapshot.exists()) {
+              const user = normalizeRemoteUsers([{ ...snapshot.data(), id: snapshot.data()?.id ?? snapshot.id }], settingsRef.current)[0];
+              usersRef.current = [user];
+              setUsers([user]);
+              granularBaselineRef.current.users.set(String(user.id), user);
+            } else {
+              usersRef.current = [];
+              setUsers([]);
+            }
+            markGranularLoaded('users');
+          }, error => { retry(error); setIsDataLoaded(true); });
+          unsubs.push(unsubscribe);
+        }
 
         // Kota optimizasyonu: öğrenci cihazları yönetim arşivlerini gerçek zamanlı dinlemez.
         // Log / ihlal / geri bildirim koleksiyonları yalnızca yönetici paneli açıkken dinlenir.
@@ -2481,6 +2548,8 @@ function MainApp() {
         return fail('11_fcm_token_bos', 'Firebase FCM token üretmedi.');
       }
 
+      await runStudentActivity('register-push-token', { token });
+
       pushRegistrationRef.current = {
         userId,
         token,
@@ -2776,9 +2845,28 @@ function MainApp() {
   const saveAppendOutbox = () => {
     try { localStorage.setItem('sgm_append_outbox', JSON.stringify(readAppendOutbox())); } catch (error) { console.warn('Bekleyen kayıtlar saklanamadı:', error); }
   };
+  const isStudentAuditType = type => [
+    'SISTEM_GIRIS', 'PIL_AYARI_BILGILENDIRME', 'OGRENCI_CIKIS', 'GERIBILDIRIM_ACILDI',
+    'MASA_', 'MOLA_', 'BILDIRIM_IPTAL', 'KISITLI_ISLEM_ENGELLENDI',
+    'MASA_BEKLEME_ENGELLENDI', 'AYNI_', 'UYGULAMA_'
+  ].some(prefix => String(type || '').startsWith(prefix)) && !String(type || '').includes('ADMIN');
   const bucketDeletionKey = bucket => ({ sgmAudit: 'logs', sgmLogs: 'logs', sgmViolations: 'violations', sgmFeedback: 'feedback' })[bucket];
   const persistAppendItem = async item => {
     if (!db || !fbUser || !navigator.onLine || Date.now() < quotaBackoffUntilRef.current) throw new Error('Kayıt cihazda bekliyor; bağlantı/kota düzeldiğinde gönderilecek.');
+    if (!adminAuthorized) {
+      if (item.delete) throw new Error('Öğrenci oturumu geçmiş kayıtları silemez.');
+      if (item.bucket === 'sgmFeedback') {
+        await runStudentActivity('feedback', { id: item.record.id, type: item.record.type, message: item.record.message });
+      } else if (item.bucket === 'sgmAudit') {
+        await runStudentActivity('audit-event', { record: item.record });
+      } else {
+        throw new Error('Bu kayıt türü yalnızca yönetici tarafından yazılabilir.');
+      }
+      const key = `${item.bucket}/${item.documentId}`;
+      if (stableJson(readAppendOutbox()[key]) === stableJson(item)) delete readAppendOutbox()[key];
+      saveAppendOutbox();
+      return;
+    }
     const deletionBucket = bucketDeletionKey(item.bucket);
     await runTransaction(db, async tx => {
       const target = getLiveDoc(item.bucket, item.documentId);
@@ -2802,6 +2890,14 @@ function MainApp() {
     if (!db || !fbUser || !navigator.onLine || Date.now() < quotaBackoffUntilRef.current) return;
     for (const item of Object.values(readAppendOutbox())) {
       const bucket = bucketDeletionKey(item.bucket);
+      if (!adminAuthorized && (item.bucket === 'sgmFeedback'
+        ? !['complaint', 'suggestion'].includes(item.record?.type)
+        : item.bucket !== 'sgmAudit' || !isStudentAuditType(item.record?.type))) {
+        console.warn('Yönetici yetkisi gerektiren bekleyen kayıt öğrenci oturumundan gönderilmedi:', item.bucket, item.record?.id);
+        delete readAppendOutbox()[`${item.bucket}/${item.documentId}`];
+        saveAppendOutbox();
+        continue;
+      }
       if (!item.delete && bucket && isRecordDeleted(bucket, item.record.id)) {
         delete readAppendOutbox()[`${item.bucket}/${item.documentId}`]; saveAppendOutbox(); continue;
       }
@@ -2904,11 +3000,12 @@ function MainApp() {
     logsRef.current = nextLogs;
     setLogs(nextLogs);
     try { localStorage.setItem('sgm_logs', JSON.stringify(nextLogs)); } catch {}
-    archiveLog(newLog);
+    const studentEvent = isStudentAuditType(type);
+    if (adminAuthorized || studentEvent) archiveLog(newLog);
     if (type === 'ADMIN_MASA_MESAJI' && userId) queueAppend('sgmMessages', newLog, { documentId: userId, replace: true });
     // One canonical event document. Students never listen to the global archive.
 
-    if (String(type || '').startsWith('IHLAL')) {
+    if (adminAuthorized && String(type || '').startsWith('IHLAL')) {
       const violationRecord = {
         id: `VIOL-${newLog.id}`,
         sourceLogId: newLog.id,
@@ -3118,7 +3215,9 @@ function MainApp() {
     if (expiredDeskJobsRef.current.has(deskId) || !fbUser || !navigator.onLine || Date.now() < quotaBackoffUntilRef.current) return;
     expiredDeskJobsRef.current.add(deskId);
     try {
-      const result = await cloudActions.expireDesk(deskId);
+      const result = adminAuthorized
+        ? await cloudActions.expireDesk(deskId)
+        : await runStudentDeskAction('expire', { deskId });
       if (!result) return;
       applyCloudRows(result);
       if (result.verified) return;
@@ -3739,7 +3838,10 @@ function MainApp() {
       if (!fbUser || !granularSyncReadyRef.current || !navigator.onLine || Date.now() < quotaBackoffUntilRef.current) return showMessage('Bağlantı Bekleniyor', 'Masa seçimi için sunucu bağlantısı gerekli. Lütfen bağlantı/kota düzeldikten sonra tekrar deneyin.', 'warning');
       if (deskActionInFlightRef.current) return;
       deskActionInFlightRef.current = true;
-      try { reserved = await cloudActions.reserve({ userId: currentUser.id, deskId, deviceId }); applyCloudRows(reserved); }
+      try {
+        reserved = await runStudentDeskAction('reserve', { deskId, deviceId });
+        applyCloudRows(reserved);
+      }
       catch (error) { handleFirestoreQuotaError(error); return showMessage('Masa Seçilemedi', error.message, 'warning'); }
       finally { deskActionInFlightRef.current = false; }
     }
@@ -3773,9 +3875,19 @@ function MainApp() {
     showMessage("Masa Seçildi", `Masa ${deskId} seçildi. Bu masanın QR kodunu 5 dakika içinde okutmalısınız.`, "success");
   };
 
-  const cancelDeskSelection = (reason = 'Öğrenci masa seçimini iptal etti.') => {
+  const cancelDeskSelection = async (reason = 'Öğrenci masa seçimini iptal etti.') => {
     if (!currentUser) return;
     const oldDeskId = selectedDeskId;
+    if (oldDeskId && db) {
+      try {
+        const result = await runStudentDeskAction('cancel', { deskId: oldDeskId });
+        if (result) applyCloudRows(result);
+      } catch (error) {
+        handleFirestoreQuotaError(error);
+        showMessage('Rezervasyon İptal Edilemedi', error.message, 'warning');
+        return;
+      }
+    }
     if (pendingReservationGuardRef.current?.userId === currentUser.id) pendingReservationGuardRef.current = null;
     criticalDeskMutationRef.current = true;
     setSelectedDeskId(null);
@@ -3828,7 +3940,6 @@ function MainApp() {
         const createUser = rows => ({
           id: 'REG-' + token,
           name: 'Yeni Kayıt',
-          // Eski veri bağlantıları için iç kimlik korunur; girişte ve kullanıcı tablosunda kullanılmaz.
           identityNo: createEightDigitCode(new Set(rows.map(u => u.identityNo))),
           specialCode: createEightDigitCode(new Set(rows.map(u => u.specialCode))),
           pin: createEightDigitCode(new Set(rows.map(u => u.pin))),
@@ -3840,11 +3951,17 @@ function MainApp() {
           strikes: 0, blocked: false, canReport: true, createdAt: Date.now()
         });
         if (db && fbUser) {
-          // Yeni hesapta artık tüm kullanıcı listesini taşıyan allData belgesi yazılmaz.
-          // Sadece oluşturulan kullanıcının kendi belgesi kaydedilir.
-          user = createUser(usersRef.current || []);
-          user.name = `Yeni Kayıt • ${user.specialCode}`;
-          await setDoc(getLiveDoc('sgmUsers', user.id), user);
+          const idToken = await fbUser.getIdToken();
+          const response = await fetch('/api/student-register', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+            body: JSON.stringify({})
+          });
+          const payload = await response.json().catch(() => null);
+          if (!response.ok || payload?.ok !== true || !payload?.user?.id || !payload?.credentials?.specialCode || !payload?.credentials?.pin) {
+            throw new Error(payload?.message || `Kayıt servisi HTTP ${response.status} döndürdü.`);
+          }
+          user = { ...payload.user, ...payload.credentials };
           granularBaselineRef.current.users.set(String(user.id), user);
         } else {
           user = createUser(usersRef.current || []); user.name = `Yeni Kayıt • ${user.specialCode}`;
@@ -3945,7 +4062,7 @@ function MainApp() {
     addLog('KAYIT_GIRIS_HAZIRLANDI', 'GM Özel Kod ve şifre giriş alanlarına aktarıldı.');
   };
 
-  const handleStudentLogin = (e, credentials = null) => {
+  const handleStudentLogin = async (e, credentials = null) => {
     e.preventDefault();
     
     if (!isDataLoaded) {
@@ -3960,18 +4077,34 @@ function MainApp() {
     if(!/^\d{8}$/.test(rawPhone) || !/^\d{8}$/.test(String(credentials?.pin || loginPin || e.target.pin?.value || ''))) return showMessage("Bilgileri Kontrol Edin","GM Özel Kod ve şifre 8 rakamdan oluşmalıdır.","warning");
     const rawPin = String(credentials?.pin || loginPin || e.target.pin?.value || '');
     
-    const cleanInputPhone = cleanIdentityFormat(rawPhone);
-    const cleanInputPin = cleanPinFormat(rawPin);
-    
-    const safeUsers = Array.isArray(users) ? users : [];
-    
-    let user = safeUsers.find(u => {
-        const cleanDbPhone = cleanIdentityFormat(u.specialCode);
-        const cleanDbPin = cleanPinFormat(u.pin);
-        return cleanDbPhone === cleanInputPhone && cleanDbPin === cleanInputPin;
-    });
-
-    if (!user) { addLog('OGRENCI_GIRIS_HATA', 'Başarısız öğrenci giriş denemesi.'); return showMessage('Giriş Başarısız', 'GM Özel Kod veya şifre hatalı. Her ikisi de 8 rakam olmalıdır.', 'danger'); }
+    try {
+      const response = await fetch('/api/student-login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ specialCode: rawPhone, pin: rawPin })
+      });
+      const payload = await response.json().catch(() => null);
+      if (response.status === 401 || response.status === 400) {
+        addLog('OGRENCI_GIRIS_HATA', 'Başarısız öğrenci giriş denemesi.');
+        return showMessage('Giriş Başarısız', 'GM Özel Kod veya şifre hatalı. Her ikisi de 8 rakam olmalıdır.', 'danger');
+      }
+      if (!response.ok || payload?.ok !== true || !payload?.token || !payload?.user?.id) {
+        return showMessage('Giriş Hatası', payload?.message || `Öğrenci giriş servisi HTTP ${response.status} döndürdü. Bağlantıyı kontrol edip tekrar deneyin.`, 'danger');
+      }
+      if (!auth) throw new Error('Firebase ayarları bulunamadı.');
+      const credential = await signInWithCustomToken(auth, payload.token);
+      const tokenResult = await credential.user.getIdTokenResult(true);
+      if (tokenResult.claims.role !== 'student' || credential.user.uid !== payload.user.id) {
+        await signOut(auth);
+        await signInAnonymously(auth);
+        throw new Error('Öğrenci oturumu doğrulanamadı.');
+      }
+      const user = normalizeRemoteUsers([payload.user], settingsRef.current)[0];
+      const safeUsers = [user];
+      usersRef.current = safeUsers;
+      setUsers(safeUsers);
+      localStorage.setItem('sgm_users', JSON.stringify(safeUsers));
+      granularBaselineRef.current.users.set(String(user.id), user);
 
     // Kısıtlı kullanıcı da giriş yapar; işlem yetkileri güncel hesap kaydıyla kontrol edilir.
     const pendingIsValid = user.pendingDeskId && user.pendingDeskDeadline && Number(user.pendingDeskDeadline) > Date.now();
@@ -3981,8 +4114,8 @@ function MainApp() {
       pendingDeskId: pendingIsValid ? user.pendingDeskId : null,
       pendingDeskDeadline: pendingIsValid ? user.pendingDeskDeadline : null
     };
-    usersRef.current = safeUsers.map(u => u.id === user.id ? updatedUser : u);
-    setUsers(usersRef.current);
+    usersRef.current = [updatedUser];
+    setUsers([updatedUser]);
     localStorage.setItem('sgm_student_session', JSON.stringify({ userId: updatedUser.id }));
     setCurrentUser(updatedUser);
     setSelectedDeskId(pendingIsValid ? Number(user.pendingDeskId) : null);
@@ -4003,6 +4136,24 @@ function MainApp() {
 
     setLoginIdentity('');
     setLoginPin('');
+    } catch (error) {
+      console.error('Öğrenci giriş hatası:', error);
+      showMessage('Bağlantı Hatası', error.message || 'Öğrenci giriş servisine ulaşılamadı.', 'danger');
+    }
+  };
+
+  const logoutStudent = async () => {
+    addLog('OGRENCI_CIKIS', 'Kullanıcı kendi isteğiyle çıkış yaptı.', null, currentUser?.id);
+    localStorage.removeItem('sgm_student_session');
+    setCurrentUser(null);
+    setView('role_select');
+    setUsers([]);
+    usersRef.current = [];
+    localStorage.removeItem('sgm_users');
+    if (auth) {
+      await signOut(auth);
+      await signInAnonymously(auth);
+    }
   };
 
 
@@ -4170,7 +4321,7 @@ function MainApp() {
         if (deskActionInFlightRef.current) return;
         deskActionInFlightRef.current = true;
         try {
-          claimed = await cloudActions.claim({ userId: currentUser.id, deskId, deviceId, qrCode: qrData });
+          claimed = await runStudentDeskAction('claim', { deskId, deviceId, qrCode: qrData });
           applyCloudRows(claimed);
         } catch (error) { handleFirestoreQuotaError(error); return showMessage('Masa Alınamadı', error.message, 'warning'); }
         finally { deskActionInFlightRef.current = false; }
@@ -4283,10 +4434,44 @@ function MainApp() {
                 <p className="text-slate-600 font-medium">Masa kullanımınızı tamamen sonlandırmak istediğinize emin misiniz? (Bu işlem masayı diğer kullanıcılara açar. 30 dakika boyunca yeniden masa alamazsınız; sistem hatasında yönetici masa atayabilir.)</p>
                 <div className="flex gap-3">
                     <button onClick={closeMessage} className="flex-1 py-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl font-bold transition-colors">İptal</button>
-                    <button onClick={() => {
+                    <button onClick={async () => {
                         const leavingUserId = currentUser.id;
                         const deskId = currentUser.activeDeskId;
                         const nowTime = Date.now();
+
+                        if (db) {
+                          try {
+                            const result = await runStudentDeskAction('leave', { deskId });
+                            applyCloudRows(result);
+                            confirmedDeskGuardRef.current = null;
+                            pendingReservationGuardRef.current = null;
+                            setSelectedDeskId(null);
+                            setDeskSelectionDeadline(null);
+                            setScannerConfig({ isOpen: false, mode: null, title: '' });
+                            releasedDeskGuardRef.current = {
+                              userId: leavingUserId,
+                              deskId: Number(deskId),
+                              mode: result.leaveMode || 'desk_empty',
+                              releasedAt: result.at || nowTime,
+                              expiresAt: (result.at || nowTime) + 45000
+                            };
+                            addLog('MASA_BIRAKILDI', `Masa ${deskId} isteyerek bırakıldı. Masa ve bekleyen rezervasyon kayıtları temizlendi.`, deskId, leavingUserId);
+                            addLog('MASA_BEKLEME_BASLADI', 'Masa bırakıldı; 30 dakikalık yeniden masa alma bekleme süresi başladı.', deskId, leavingUserId);
+                            closeMessage();
+                            setView('student_dash');
+                            setTimeout(() => showMessage(
+                              'Başarılı',
+                              result.leaveMode === 'desk_empty'
+                                ? 'Masanızı bıraktınız. 30 dakika sonra yeniden masa alabilirsiniz. Sistem hatasında yönetici masa atayabilir.'
+                                : 'Masa oturumunuz sonlandırıldı. Sistem durumu senkronize edildi.',
+                              'success'
+                            ), 300);
+                          } catch (error) {
+                            handleFirestoreQuotaError(error);
+                            showMessage('Masa Bırakılamadı', error.message, 'warning');
+                          }
+                          return;
+                        }
 
                         const liveDesks = Array.isArray(desksRef.current) ? desksRef.current : [];
                         const liveUsers = Array.isArray(usersRef.current) ? usersRef.current : [];
@@ -4487,7 +4672,7 @@ function MainApp() {
     });
   };
 
-  const startBreak = (type) => {
+  const startBreak = async (type) => {
     if (!currentUser || !currentUser.activeDeskId) return;
     const safeUsers = Array.isArray(users) ? users : [];
     const myUser = safeUsers.find(u => u.id === currentUser.id);
@@ -4516,17 +4701,27 @@ function MainApp() {
     const durationMs = durationStr * 60 * 1000;
 
     const myRole = myUser.activeDeskRole || 'owner';
-    setDesks(prev => Array.isArray(prev) ? prev.map(d => d.id === currentUser.activeDeskId
-      ? (myRole === 'guest'
-          ? { ...d, guestBreakEndTime: Date.now() + durationMs }
-          : { ...d, status: 'on_break', breakEndTime: Date.now() + durationMs })
-      : d) : []);
-    setUsers(prev => Array.isArray(prev) ? prev.map(u => u.id === currentUser.id ? { ...u, breaks: { ...u.breaks, [type]: u.breaks[type] - 1 } } : u) : []);
+    if (db) {
+      try {
+        const result = await runStudentDeskAction('break-start', { deskId: currentUser.activeDeskId, type });
+        applyCloudRows(result);
+      } catch (error) {
+        handleFirestoreQuotaError(error);
+        return showMessage('Mola Başlatılamadı', error.message, 'warning');
+      }
+    } else {
+      setDesks(prev => Array.isArray(prev) ? prev.map(d => d.id === currentUser.activeDeskId
+        ? (myRole === 'guest'
+            ? { ...d, guestBreakEndTime: Date.now() + durationMs }
+            : { ...d, status: 'on_break', breakEndTime: Date.now() + durationMs })
+        : d) : []);
+      setUsers(prev => Array.isArray(prev) ? prev.map(u => u.id === currentUser.id ? { ...u, breaks: { ...u.breaks, [type]: u.breaks[type] - 1 } } : u) : []);
+    }
     
     addLog('MOLA_BAŞLADI', `${myRole === 'guest' ? 'Misafir - ' : ''}${type === 'short' ? 'Kısa' : 'Uzun'} mola başlatıldı.`, currentUser.activeDeskId, currentUser.id);
   };
 
-  const returnFromBreak = (qrData) => {
+  const returnFromBreak = async (qrData) => {
     if (!currentUser || !currentUser.activeDeskId) {
       setScannerConfig({ isOpen: false, mode: null });
       return showMessage("Hata", "Aktif masa bilginiz bulunamadı.", "danger");
@@ -4553,8 +4748,18 @@ function MainApp() {
         setScannerConfig({ isOpen: false, mode: null });
         return showMessage("Hata", "Moladan dönmek için bulunduğunuz masanın güncel karekodunu okutmalısınız.", "danger");
       }
-      setDesks(prev => Array.isArray(prev) ? prev.map(d => d.id === currentUser.activeDeskId ? { ...d, guestBreakEndTime: null } : d) : []);
-      setUsers(prev => Array.isArray(prev) ? prev.map(u => u.id === currentUser.id ? { ...u, lastActiveTime: Date.now() } : u) : []);
+      if (db) {
+        try {
+          const result = await runStudentDeskAction('break-end', { deskId: currentUser.activeDeskId, qrCode });
+          applyCloudRows(result);
+        } catch (error) {
+          handleFirestoreQuotaError(error);
+          return showMessage('Moladan Dönülemedi', error.message, 'warning');
+        }
+      } else {
+        setDesks(prev => Array.isArray(prev) ? prev.map(d => d.id === currentUser.activeDeskId ? { ...d, guestBreakEndTime: null } : d) : []);
+        setUsers(prev => Array.isArray(prev) ? prev.map(u => u.id === currentUser.id ? { ...u, lastActiveTime: Date.now() } : u) : []);
+      }
       addLog('MOLA_BİTTİ', `Misafir kullanıcı masa QR kodunu okutarak moladan erken döndü.`, currentUser.activeDeskId, currentUser.id);
       setScannerConfig({ isOpen: false, mode: null });
       return showMessage("Hoş Geldiniz", "QR doğrulandı. Misafir molanız sonlandırıldı.", "success");
@@ -4570,17 +4775,27 @@ function MainApp() {
       return showMessage("Hata", "Moladan dönmek için kendi masanızdaki güncel karekodu okutmalısınız.", "danger");
     }
 
-    setDesks(prev => Array.isArray(prev) ? prev.map(d =>
-      d.id === currentUser.activeDeskId
-        ? { ...d, status: 'occupied', breakEndTime: null }
-        : d
-    ) : []);
+    if (db) {
+      try {
+        const result = await runStudentDeskAction('break-end', { deskId: currentUser.activeDeskId, qrCode });
+        applyCloudRows(result);
+      } catch (error) {
+        handleFirestoreQuotaError(error);
+        return showMessage('Moladan Dönülemedi', error.message, 'warning');
+      }
+    } else {
+      setDesks(prev => Array.isArray(prev) ? prev.map(d =>
+        d.id === currentUser.activeDeskId
+          ? { ...d, status: 'occupied', breakEndTime: null }
+          : d
+      ) : []);
 
-    setUsers(prev => Array.isArray(prev) ? prev.map(u =>
-      u.id === currentUser.id
-        ? { ...u, lastActiveTime: Date.now() }
-        : u
-    ) : []);
+      setUsers(prev => Array.isArray(prev) ? prev.map(u =>
+        u.id === currentUser.id
+          ? { ...u, lastActiveTime: Date.now() }
+          : u
+      ) : []);
+    }
 
     addLog('MOLA_BİTTİ', `Öğrenci kendi masasının QR kodunu okutarak moladan erken döndü.`, currentUser.activeDeskId, currentUser.id);
     setScannerConfig({ isOpen: false, mode: null });
@@ -4634,7 +4849,7 @@ function MainApp() {
     }
   };
 
-  const handleReportSubmit = (deskId, name, identityNo, targetRole = 'owner', targetUserId = null) => {
+  const handleReportSubmit = async (deskId, name, identityNo, targetRole = 'owner', targetUserId = null) => {
     const freshReporter = requireStudentAction('Boş masa ihbarı gönderme');
     if (!freshReporter) return;
     if (freshReporter.canReport === false || !settings.reportsEnabled) return showMessage('İhbar Kapalı', 'İhbar etme yetkisi kapalıdır.', 'warning');
@@ -4653,7 +4868,7 @@ function MainApp() {
       return showMessage('İhbar Gönderilemedi', 'Masa durumu değişti veya bu kullanıcı için ihbar uygun değil.', 'warning');
     }
 
-    const reportWaitMinutes = Number.isFinite(Number(settings.reportWaitTime)) && Number(settings.reportWaitTime) > 0 ? Number(settings.reportWaitTime) : 5;
+    let reportWaitMinutes = Number.isFinite(Number(settings.reportWaitTime)) && Number(settings.reportWaitTime) > 0 ? Number(settings.reportWaitTime) : 5;
     const waitTimeMs = reportWaitMinutes * 60 * 1000;
     const notificationTargetUserId = targetUserId || currentUser.id;
     const reportIssuedAt = Date.now();
@@ -4661,6 +4876,7 @@ function MainApp() {
     let reportLog = null;
 
     if (targetRole === 'guest') {
+      if (db) return showMessage('İhbar Gönderilemedi', 'Misafir oturumları için ihbar işlemi artık desteklenmiyor.', 'warning');
       setDesks(prev => Array.isArray(prev) ? prev.map(d => d.id === deskId ? { ...d, guestReported: true, guestReportIssuedAt: reportIssuedAt, guestReportVerifiedAt: null, guestReportEndTime: reportIssuedAt + waitTimeMs } : d) : []);
       reportLog = addLog('İHBAR_MISAFIR', `Masa ${deskId} misafir kullanıcısı masada bulunmadığı gerekçesiyle ihbar edildi. Bildiren: ${name} (${identityNo})`, deskId, notificationTargetUserId);
 
@@ -4674,8 +4890,21 @@ function MainApp() {
         logId: reportLog?.id || null
       });
     } else {
-      setDesks(prev => Array.isArray(prev) ? prev.map(d => d.id === deskId ? { ...d, status: 'reported', reportIssuedAt, reportVerifiedAt: null, reportEndTime: reportIssuedAt + waitTimeMs } : d) : []);
-      reportLog = addLog('İHBAR', `Masa ${deskId} ana kullanıcısı masada bulunmadığı gerekçesiyle ihbar edildi. Bildiren: ${name} (${identityNo})`, deskId, notificationTargetUserId);
+      let reportEventId;
+      if (db) {
+        try {
+          const result = await runStudentDeskAction('report', { deskId, targetUserId: notificationTargetUserId });
+          reportWaitMinutes = result.waitMinutes || reportWaitMinutes;
+          reportEventId = result.eventId;
+          applyCloudRows(result);
+        } catch (error) {
+          handleFirestoreQuotaError(error);
+          return showMessage('İhbar Gönderilemedi', error.message, 'warning');
+        }
+      } else {
+        setDesks(prev => Array.isArray(prev) ? prev.map(d => d.id === deskId ? { ...d, status: 'reported', reportIssuedAt, reportVerifiedAt: null, reportEndTime: reportIssuedAt + waitTimeMs } : d) : []);
+      }
+      reportLog = addLog('İHBAR', `Masa ${deskId} ana kullanıcısı masada bulunmadığı gerekçesiyle ihbar edildi. Bildiren: ${name} (${identityNo})`, deskId, notificationTargetUserId, false, null, reportEventId ? { eventId: reportEventId } : null);
 
       // Mevcut ihbar akışını değiştirmeden masa sahibinin telefonuna gerçek push gönder.
       sendServerPush({
@@ -4692,7 +4921,7 @@ function MainApp() {
     showMessage("İhbar Alındı", `Masa ${deskId} için ${targetRole === 'guest' ? 'misafir' : 'ana kullanıcı'} adına ${reportWaitMinutes} dakikalık doğrulama süreci başlatıldı.`, "success");
   };
 
-  const handleVerifyImHere = (qrData) => {
+  const handleVerifyImHere = async (qrData) => {
     const parts = qrData.split('-');
     if (parts.length < 2) {
         setScannerConfig({isOpen: false, mode: null});
@@ -4711,6 +4940,16 @@ function MainApp() {
     const verifyUser = liveUsers.find(u => u.id === currentUser.id);
     const verifyRole = verifyUser?.activeDeskRole || currentUser.activeDeskRole || 'owner';
 
+    if (db) {
+      try {
+        const result = await runStudentDeskAction('verify', { deskId, qrCode: qrData });
+        applyCloudRows(result);
+      } catch (error) {
+        handleFirestoreQuotaError(error);
+        setScannerConfig({ isOpen: false, mode: null, title: '' });
+        return showMessage('Doğrulama Başarısız', error.message, 'warning');
+      }
+    } else {
     // QR doğrulaması state kuyruğuna bırakılmadan önce Ref üzerinde de anında uygulanır.
     // 1 saniyelik ihlal zamanlayıcısı aynı anda çalışsa bile artık eski "reported" durumunu göremez.
     const verifiedDesks = liveDesks.map(d => d.id === deskId
@@ -4738,6 +4977,7 @@ function MainApp() {
     usersRef.current = verifiedUsers;
     setUsers(verifiedUsers);
     setCurrentUser(prev => prev ? { ...prev, lastActiveTime: nowTime } : prev);
+    }
 
     // Aynı ihbar için bildirim anahtarını da çözüldü olarak kabul et.
     lastReportNotifiedRef.current = null;
@@ -6535,7 +6775,7 @@ function MainApp() {
                 )}
                 <button disabled={studentRestricted} onClick={openStudentFeedback} className="text-purple-700 bg-purple-50 px-3 py-2 rounded-xl font-bold text-sm">Dilek / Şikayet</button>
                 <button onClick={() => setShowRules(true)} className="text-blue-600 hover:text-blue-800 bg-blue-50 p-2 rounded-full flex items-center gap-1 text-sm font-bold px-3"><Info className="w-5 h-5" /> <span className="hidden sm:inline">Kurallar</span></button>
-                <button onClick={() => { addLog('OGRENCI_CIKIS', 'Kullanıcı kendi isteğiyle çıkış yaptı.', null, currentUser?.id); localStorage.removeItem('sgm_student_session'); setCurrentUser(null); setView('role_select'); }} className="text-slate-500 hover:text-slate-800 bg-slate-100 p-2 rounded-full"><LogOut className="w-5 h-5" /></button>
+                <button onClick={logoutStudent} className="text-slate-500 hover:text-slate-800 bg-slate-100 p-2 rounded-full"><LogOut className="w-5 h-5" /></button>
               </div>
             </nav>
 
