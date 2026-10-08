@@ -1,3 +1,5 @@
+// EK DÜZELTME: Eski cihaz kayıt engeli kaldırıldı; sunucu kimlik doğrulaması korunur.
+// Tekli/toplu kısıt kaldırmada ihbar yetkisi açılır; eski aktif hesaplar YP'de onarılır.
 // 2026-10-08 EK SENKRONİZASYON DÜZELTMELERİ:
 // - Silinen öğrenci hesabının cihaz oturumu ve ilgili kayıt önbelleği temizlenir.
 // - Yönetici listesinde eski yerel kullanıcılar sunucu silmesini geri alamaz.
@@ -353,6 +355,10 @@ const validRegistrationUrl = value => {
 };
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 const isRestricted = (user, at = Date.now()) => user?.blocked === true || user?.pendingApproval === true || Number(user?.restrictedUntil || 0) > at;
+const shouldRestoreReportPermission = (user, at = Date.now()) => Boolean(user) && !isRestricted(user, at) && user.canReport === false && (
+  Number(user.reportPermissionPolicyVersion || 0) < 1 ||
+  Number(user.restrictedUntil || 0) > Number(user.reportPermissionRestrictionUntil || 0)
+);
 const lostDeskToday = (user, deskId) => user?.lostDeskDate === getLocalDayKey() && (user?.lostDeskIds || []).includes(Number(deskId));
 const applyViolationPolicy = (user, deskId, at = Date.now()) => {
   const history = [...(Array.isArray(user.violationHistory) ? user.violationHistory : []), at];
@@ -4136,11 +4142,33 @@ function MainApp() {
       if (!isDataLoaded) throw new Error('Sistem verileri yüklenene kadar bekleyin.');
       // Hesap oluşturma Google Form bağlantısından bağımsızdır. Link yalnızca Devam Et adımında kontrol edilir.
       // Aynı cihazda kayıt bilgileri duruyorsa yeni hesap yerine mevcut kısıtlı hesabı göster.
-      const saved = JSON.parse(localStorage.getItem('sgm_registration_account') || 'null');
+      const saved = (() => { try { return JSON.parse(localStorage.getItem('sgm_registration_account') || 'null'); } catch { return null; } })();
+      let registrationAuthUser = auth?.currentUser || fbUser;
       let user = (usersRef.current || []).find(u => u.id === saved?.userId);
-      if (!user && saved?.userId && db && fbUser && String(saved.userId) !== String(fbUser.uid)) {
-        // Başka/yenilenmiş tarayıcı kimliğiyle eski hesabın yerine yeni hesap açma.
-        throw new Error('Bu cihazda önceki bir hesap kaydı var ancak oturum kimliği değişmiş. Mevcut GM Özel Kod ve şifrenizle giriş yapın; bilgilerinizi bilmiyorsanız sorumlu ile iletişime geçin.');
+      if (db && user && String(user.id) !== String(registrationAuthUser?.uid)) user = null;
+      if (user && (isRecordDeleted('users', user.id) || serverDeletedUserIdsRef.current.has(String(user.id)))) user = null;
+      if (!user && saved?.userId) {
+        // Silinen hesabın veya önceki oturumun cihazda kalan kaydı yeni kaydı engellemez.
+        localStorage.removeItem('sgm_registration_account');
+        ['sgm_registration_token', 'sgm_registration_credentials', 'sgm_registration_form_url', 'sgm_registration_form_opened'].forEach(key => sessionStorage.removeItem(key));
+        setRegistrationPending(''); setRegistrationResult(null);
+        setRegistrationFormUrl(''); setRegistrationFormOpened(false);
+        const oldSession = (() => { try { return JSON.parse(localStorage.getItem('sgm_student_session') || 'null'); } catch { return null; } })();
+        if (oldSession?.userId === saved.userId) localStorage.removeItem('sgm_student_session');
+      }
+      if (db && !user) {
+        if (!auth) throw new Error('Firebase oturumu başlatılamadı.');
+        // Silinmiş öğrenci tokenı kayıt API'sine gönderilmez. Doğrulanmış anonim
+        // oturum oluşturulur; istemci yeni hesabın kimliğini kendisi seçmez.
+        if (registrationAuthUser && (!registrationAuthUser.isAnonymous ||
+            serverDeletedUserIdsRef.current.has(String(registrationAuthUser.uid)) ||
+            isRecordDeleted('users', registrationAuthUser.uid))) {
+          await signOut(auth);
+          registrationAuthUser = null;
+          setCurrentUser(null); setSelectedDeskId(null); setDeskSelectionDeadline(null);
+        }
+        if (!registrationAuthUser) registrationAuthUser = (await signInAnonymously(auth)).user;
+        setFbUser(registrationAuthUser);
       }
       // Aynı doğrulanmış anonim oturumda eksik yerel hesap, kayıt API'sinden
       // yeniden getirilir. API mevcut hesabı döndürür; kod/şifre değiştirilmez.
@@ -4159,8 +4187,8 @@ function MainApp() {
           breaks: { short: settings.shortBreakCount, long: settings.longBreakCount },
           strikes: 0, blocked: false, canReport: true, createdAt: Date.now()
         });
-        if (db && fbUser) {
-          const idToken = await fbUser.getIdToken();
+        if (db) {
+          const idToken = await registrationAuthUser.getIdToken();
           const response = await fetch('/api/student-register', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
@@ -4170,7 +4198,7 @@ function MainApp() {
           if (!response.ok || payload?.ok !== true || !payload?.user?.id || !payload?.credentials?.specialCode || !payload?.credentials?.pin) {
             throw new Error(payload?.message || `Kayıt servisi HTTP ${response.status} döndürdü.`);
           }
-          if (String(payload.user.id) !== String(fbUser.uid)) {
+          if (String(payload.user.id) !== String(registrationAuthUser.uid)) {
             throw new Error('Kayıt sonucu doğrulanmış cihaz oturumuyla eşleşmiyor.');
           }
           user = { ...payload.user, ...payload.credentials };
@@ -5715,7 +5743,7 @@ function MainApp() {
         break;
       case 'toggle_report_auth':
         if (userId) {
-          setUsers(prev => Array.isArray(prev) ? prev.map(u => u.id === userId ? { ...u, canReport: u.canReport === false } : u) : []);
+          setUsers(prev => Array.isArray(prev) ? prev.map(u => u.id === userId ? { ...u, canReport: u.canReport === false, reportPermissionPolicyVersion: 1, reportPermissionRestrictionUntil: Number(u.restrictedUntil || 0) } : u) : []);
           addLog('ADMIN_YETKI', `Kullanıcının ihbar yetkisi değiştirildi.`, null, userId);
         }
         break;
@@ -5875,6 +5903,12 @@ function MainApp() {
               restrictionReason: restrictionDays > 0 ? 'Yönetici tarafından süreli kısıtlama' : '',
               canReport: newCanReport
             };
+            // Onay/engel/süreli kısıt kalktığı anda ihbar yetkisini de aç.
+            if (isRestricted(user) && !isRestricted(updatedUser)) updatedUser.canReport = true;
+            if (!isRestricted(updatedUser)) {
+              updatedUser.reportPermissionPolicyVersion = 1;
+              updatedUser.reportPermissionRestrictionUntil = Number(updatedUser.restrictedUntil || 0);
+            }
 
             pushUndoSnapshot('Kullanıcı bilgilerini düzenleme');
             usersRef.current = (usersRef.current || []).map(u => u.id === user.id ? updatedUser : u);
@@ -6251,13 +6285,52 @@ function MainApp() {
     pushUndoSnapshot('Toplu kullanıcı işlemi');
     let next = current;
     if (action === 'block') next = current.map(u => ids.has(String(u.id)) ? { ...u, blocked: false, restrictedUntil: Date.now() + Math.max(1, Number(bulkRestrictionDays) || 5) * 86400000, restrictionReason: 'Yönetici tarafından toplu süreli kısıtlama' } : u);
-    else if (action === 'unblock') next = current.map(u => ids.has(String(u.id)) ? { ...u, blocked: false, pendingApproval: false, restrictedUntil: 0, restrictionReason: '' } : u);
+    else if (action === 'unblock') next = current.map(u => ids.has(String(u.id)) ? { ...u, blocked: false, pendingApproval: false, restrictedUntil: 0, restrictionReason: '', canReport: true, reportPermissionPolicyVersion: 1, reportPermissionRestrictionUntil: 0 } : u);
 
     usersRef.current = next;
     setUsers(next);
     setSelectedUserIds([]);
     addLog('ADMIN_TOPLU_KULLANICI', `${ids.size} kullanıcı için ${action} toplu işlemi uygulandı.`);
   };
+
+  const reportPermissionRepairBusyRef = useRef(false);
+  useEffect(() => {
+    if (!isDataLoaded || (db && (!adminDataMode || !fbUser || !navigator.onLine || !granularLoadedRef.current.users)) || reportPermissionRepairBusyRef.current) return;
+    const candidates = (usersRef.current || []).filter(user => shouldRestoreReportPermission(user));
+    if (!candidates.length) return;
+    reportPermissionRepairBusyRef.current = true;
+    const restore = async () => {
+      try {
+        for (const candidate of candidates) {
+          const restoreTime = Date.now();
+          const patchFor = user => ({
+            canReport: true,
+            reportPermissionPolicyVersion: 1,
+            reportPermissionRestrictionUntil: Number(user.restrictedUntil || 0),
+            reportPermissionRestoredAt: restoreTime
+          });
+          const result = db ? await runTransaction(db, async tx => {
+            const userRef = getLiveDoc('sgmUsers', candidate.id);
+            const snapshot = await tx.get(userRef);
+            if (!snapshot.exists()) return null;
+            const user = { ...snapshot.data(), id: candidate.id };
+            if (!shouldRestoreReportPermission(user)) return null;
+            const patch = patchFor(user);
+            tx.set(userRef, patch, { merge: true });
+            return { ...user, ...patch };
+          }) : (() => {
+            const user = usersRef.current.find(u => u.id === candidate.id);
+            return user && shouldRestoreReportPermission(user) ? {...user, ...patchFor(user)} : null;
+          })();
+          if (!result) continue;
+          applyCloudRows({ user: result });
+          addLog('ADMIN_IHBAR_YETKISI_ACILDI', 'Hesap kısıtı bulunmayan öğrencinin ihbar yetkisi açıldı.', null, result.id);
+        }
+      } catch (error) { handleFirestoreQuotaError(error); }
+      finally { reportPermissionRepairBusyRef.current = false; }
+    };
+    restore();
+  }, [isDataLoaded, adminDataMode, fbUser, users, Math.floor(now / 15000)]);
 
   const bulkDeleteRecords = (kind) => {
     const config = {
