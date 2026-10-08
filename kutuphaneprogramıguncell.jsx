@@ -1,3 +1,4 @@
+// EK DÜZELTME: Yönetici kaydı güncel Firebase tokenıyla doğrulanır; eski oturum sonuçları yok sayılır.
 // EK DÜZELTME: Hesap onayı/kısıt değişikliği sunucu transaction'ı tamamlanmadan başarılı sayılmaz.
 // Yeni kayıtlar onay beklemeye devam eder; yönetici açıkça onayladığında öğrenci güncellenir.
 // EK DÜZELTME: Eski cihaz kayıt engeli kaldırıldı; sunucu kimlik doğrulaması korunur.
@@ -1731,7 +1732,7 @@ function MainApp() {
       setIsDataLoaded(true);
       return;
     }
-    let disposed = false, retryTimer = null, retryAttempt = 0, signingIn = false;
+    let disposed = false, retryTimer = null, retryAttempt = 0, signingIn = false, authStateEpoch = 0;
     const initAuth = async () => {
       if (disposed || signingIn) return;
       signingIn = true;
@@ -1755,6 +1756,7 @@ function MainApp() {
     window.addEventListener('online', resumeAuth);
     initAuth();
     const unsubscribe = onAuthStateChanged(auth, user => {
+      const epoch = ++authStateEpoch;
       setFbUser(user);
       if (!user) {
         setAdminAuthorized(false);
@@ -1762,7 +1764,8 @@ function MainApp() {
         setUsers([]);
         localStorage.removeItem('sgm_users');
       } else user.getIdTokenResult().then(result => {
-        if (disposed) return;
+        // Önceki anonim/öğrenci oturumunun gecikmiş sonucu yeni yönetici oturumunu ezmesin.
+        if (disposed || epoch !== authStateEpoch || auth.currentUser?.uid !== user.uid) return;
         const isAdmin = result.claims.admin === true;
         setAdminAuthorized(isAdmin);
         if (!isAdmin) {
@@ -1772,7 +1775,7 @@ function MainApp() {
           localStorage.setItem('sgm_users', JSON.stringify(usersRef.current));
         }
       }).catch(() => {
-        if (disposed) return;
+        if (disposed || epoch !== authStateEpoch || auth.currentUser?.uid !== user.uid) return;
         setAdminAuthorized(false);
         usersRef.current = [];
         setUsers([]);
@@ -2146,11 +2149,26 @@ function MainApp() {
   // Hesap düzenleme başarılı mesajı yalnızca sunucu işlemi tamamlanınca gösterilir.
   const saveAdminUserChanges = async (original, desired) => {
     if (adminUserSaveInFlightRef.current) throw new Error('Önce devam eden hesap kaydının tamamlanmasını bekleyin.');
-    if (db && (!adminAuthorized || !fbUser || !navigator.onLine)) throw new Error('Hesap değişikliğini kaydetmek için çevrimiçi yönetici oturumu gerekir.');
     adminUserSaveInFlightRef.current = true;
     setAdminUserSavingId(original.id);
     clearTimeout(granularWriteTimerRef.current);
     try {
+      if (db) {
+        if (!auth) throw new Error('Firebase oturumu bulunamadı. Yönetici paneline yeniden giriş yapın.');
+        await auth.authStateReady();
+        const liveUser = auth.currentUser;
+        if (!liveUser) throw new Error('Yönetici oturumu sona ermiş. Yönetici paneline yeniden giriş yapın.');
+        let tokenResult;
+        try { tokenResult = await liveUser.getIdTokenResult(true); }
+        catch (error) { throw new Error('Yönetici oturumu sunucudan doğrulanamadı. Bağlantınızı kontrol edip tekrar deneyin.'); }
+        if (auth.currentUser?.uid !== liveUser.uid) throw new Error('Oturum değişti. Yönetici paneline yeniden giriş yapın.');
+        if (tokenResult.claims.admin !== true) {
+          setAdminAuthorized(false);
+          throw new Error('Mevcut Firebase oturumunda yönetici yetkisi yok. Yönetici kullanıcı adı ve şifresiyle yeniden giriş yapın.');
+        }
+        // React state'i geride kalsa bile gerçek ve doğrulanmış oturum kullanılır.
+        setFbUser(liveUser); setAdminAuthorized(true);
+      }
       // Önceden sıraya alınmış yazmalar bu açık yönetici işlemini geri alamaz.
       await granularWriteChainRef.current.catch(() => {});
       const patch = Object.fromEntries(Object.entries(desired).filter(([key, value]) => key !== 'id' && stableJson(value) !== stableJson(original[key])));
@@ -7458,9 +7476,10 @@ function MainApp() {
                     return;
                   }
                   if (!auth) throw new Error('Firebase ayarları bulunamadı.');
-                  await signInWithCustomToken(auth, payload.token);
-                  const claims = await auth.currentUser.getIdTokenResult(true);
-                  if (claims.claims.admin !== true) throw new Error('Yönetici yetkisi doğrulanamadı.');
+                  const credential = await signInWithCustomToken(auth, payload.token);
+                  const claims = await credential.user.getIdTokenResult(true);
+                  if (auth.currentUser?.uid !== credential.user.uid || claims.claims.admin !== true) throw new Error('Yönetici yetkisi doğrulanamadı.');
+                  setFbUser(credential.user);
                   setAdminAuthorized(true);
                   addLog('ADMIN_GIRIS', 'Yönetici paneline giriş yapıldı.');
                   setView('admin_dash');
