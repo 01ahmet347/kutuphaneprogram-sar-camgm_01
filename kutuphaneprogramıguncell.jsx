@@ -1,3 +1,4 @@
+// EK DÜZELTME: Firebase ve öğrenci oturumları sekmeye özeldir; yetkisiz yönetici görünümü girişe döner.
 // EK DÜZELTME: Ayar kaydı ihbarı kapatmaz; yönetici listesi oturum kapsamında dinlenir.
 // Sunucu ayarları tüm açık ekranlara anında uygulanır; mola ihbarı engellenir.
 // EK DÜZELTME: Güncel anonim kayıt tokenı, ayrı öğrenci oturumu ve sunucuda atomik yönetici hesabı oluşturma.
@@ -44,7 +45,7 @@ import {
   Move, Plus, Save, PenTool, Trash2, Edit3
 } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
-import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, signOut } from 'firebase/auth';
+import { getAuth, setPersistence, browserSessionPersistence, signInAnonymously, signInWithCustomToken, onAuthStateChanged, signOut } from 'firebase/auth';
 import { getFirestore, doc, setDoc, onSnapshot, runTransaction, collection, getDoc, getDocs, getDocFromServer, query, orderBy, limit, startAfter, deleteDoc } from 'firebase/firestore';
 
 import { getMessaging, getToken, onMessage, isSupported as isMessagingSupported } from 'firebase/messaging';
@@ -53,6 +54,7 @@ import { createCloudActions } from './src/cloud-transactions.js';
 import { APP_VERSION, BUILD_COMMIT } from './src/version.js';
 
 let app, auth, db, appId;
+let tabAuthPersistenceReady = Promise.resolve(null);
 try {
   const configuredFirebase = typeof __firebase_config !== 'undefined'
     ? __firebase_config
@@ -64,6 +66,11 @@ try {
       : configuredFirebase;
     app = initializeApp(firebaseConfig);
     auth = getAuth(app);
+    // Firebase kimliği sekmeye özeldir. Öğrenci sekmesi yönetici tokenını değiştirmez.
+    tabAuthPersistenceReady = setPersistence(auth, browserSessionPersistence).then(
+      () => null,
+      error => { console.error('Sekme oturumu başlatılamadı:', error?.code || 'unknown'); return error; }
+    );
     db = getFirestore(app);
     appId = typeof __app_id !== 'undefined'
       ? __app_id
@@ -72,6 +79,19 @@ try {
 } catch (error) {
   console.error("Firebase init error:", error);
 }
+
+const ensureTabAuthPersistence = async () => {
+  const error = await tabAuthPersistenceReady;
+  if (error) throw new Error('Bu sekmede oturum saklanamadı. Tarayıcı oturum depolamasını kontrol edip yeniden giriş yapın.');
+};
+const signInTabWithCustomToken = async token => {
+  await ensureTabAuthPersistence();
+  return signInWithCustomToken(auth, token);
+};
+const signInTabAnonymously = async () => {
+  await ensureTabAuthPersistence();
+  return signInAnonymously(auth);
+};
 
 const deletedUserIds = new Set((() => {
   try { return JSON.parse(localStorage.getItem('sgm_deleted_user_ids') || '[]'); }
@@ -1081,7 +1101,7 @@ function MainApp() {
     if (!isDataLoaded || sessionRestoredRef.current) return;
     sessionRestoredRef.current = true;
     try {
-      const saved = JSON.parse(localStorage.getItem('sgm_student_session') || 'null');
+      const saved = JSON.parse(sessionStorage.getItem('sgm_student_session') || 'null');
       const user = (Array.isArray(users) ? users : []).find(u => u.id === saved?.userId);
       if (sessionCanRestore(saved, user)) {
         setCurrentUser(user);
@@ -1089,12 +1109,12 @@ function MainApp() {
         setSelectedDeskId(pending ? user.pendingDeskId : null);
         setDeskSelectionDeadline(pending ? user.pendingDeskDeadline : null);
         setView('student_dash');
-      } else localStorage.removeItem('sgm_student_session');
-    } catch { localStorage.removeItem('sgm_student_session'); }
+      } else sessionStorage.removeItem('sgm_student_session');
+    } catch { sessionStorage.removeItem('sgm_student_session'); }
   }, [isDataLoaded, users]);
   useEffect(() => {
     if (!sessionRestoredRef.current) return;
-    if (currentUser) localStorage.setItem('sgm_student_session', JSON.stringify({userId: currentUser.id, day: getLocalDayKey()}));
+    if (currentUser) sessionStorage.setItem('sgm_student_session', JSON.stringify({userId: currentUser.id, day: getLocalDayKey()}));
     // null ilk renderda da oluşur; kayıt yalnızca açık çıkış / hesap silinmesinde temizlenir.
   }, [currentUser, isDataLoaded]);
   useEffect(() => {
@@ -1105,7 +1125,7 @@ function MainApp() {
       if (!missingSessionUserSinceRef.current) missingSessionUserSinceRef.current = Date.now();
       // A failed/cache-only snapshot is not evidence of deletion.
       if (!isRecordDeleted('users', currentUser.id) && !serverDeletedUserIdsRef.current.has(String(currentUser.id))) return;
-      localStorage.removeItem('sgm_student_session');
+      sessionStorage.removeItem('sgm_student_session');
       setCurrentUser(null); setView('student_login');
       setSelectedDeskId(null); setDeskSelectionDeadline(null);
       return;
@@ -1753,12 +1773,12 @@ function MainApp() {
       if (disposed || signingIn) return;
       signingIn = true;
       try {
-        await auth.authStateReady();
+        await ensureTabAuthPersistence(); await auth.authStateReady();
         if (auth.currentUser || disposed) return;
         if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-          await signInWithCustomToken(auth, __initial_auth_token);
+          await signInTabWithCustomToken(__initial_auth_token);
         } else {
-          await signInAnonymously(auth);
+          await signInTabAnonymously();
         }
         retryAttempt = 0;
       } catch (error) {
@@ -1787,6 +1807,8 @@ function MainApp() {
         verifiedAdminUidRef.current = isAdmin ? user.uid : null;
         setAdminAuthorized(isAdmin);
         if (!isAdmin) {
+          // Eski yönetici görünümü öğrenci/anonim oturumla açık tutulmaz.
+          setView(previous => previous === 'admin_dash' ? 'admin_login' : previous);
           const ownUser = usersRef.current.find(row => String(row.id) === user.uid);
           usersRef.current = ownUser ? [ownUser] : [];
           setUsers(usersRef.current);
@@ -2174,7 +2196,7 @@ function MainApp() {
     try {
       if (db) {
         if (!auth) throw new Error('Firebase oturumu bulunamadı. Yönetici paneline yeniden giriş yapın.');
-        await auth.authStateReady();
+        await ensureTabAuthPersistence(); await auth.authStateReady();
         const liveUser = auth.currentUser;
         if (!liveUser) throw new Error('Yönetici oturumu sona ermiş. Yönetici paneline yeniden giriş yapın.');
         let tokenResult;
@@ -2289,11 +2311,11 @@ function MainApp() {
           // Yalnızca önceden bilinen, doğrulanmış hesabın sunucu snapshot'ı
           // silme kanıtıdır. Anonim oturumdaki boş belge yeni kaydı engellemez.
           const id = String(fbUser.uid);
-          const savedSession = (() => { try { return JSON.parse(localStorage.getItem('sgm_student_session') || 'null'); } catch { return null; } })();
+          const savedSession = (() => { try { return JSON.parse(sessionStorage.getItem('sgm_student_session') || 'null'); } catch { return null; } })();
           if (granularBaselineRef.current.users.has(id) || savedSession?.userId === id) {
             serverDeletedUserIdsRef.current.add(id);
             granularBaselineRef.current.users.delete(id);
-            localStorage.removeItem('sgm_student_session');
+            sessionStorage.removeItem('sgm_student_session');
             localStorage.removeItem('sgm_users');
             setCurrentUser(previous => previous?.id === id ? null : previous);
             setSelectedDeskId(null); setDeskSelectionDeadline(null);
@@ -4259,7 +4281,10 @@ function MainApp() {
     setRegistrationBusy(true); setRegistrationError('');
     try {
       if (!isDataLoaded) throw new Error('Sistem verileri yüklenene kadar bekleyin.');
-      if (db && auth) await auth.authStateReady();
+      if (db && auth) {
+        await ensureTabAuthPersistence();
+        await auth.authStateReady();
+      }
       const newPerson = sessionStorage.getItem('sgm_registration_new_person') === '1';
       // Hesap oluşturma Google Form bağlantısından bağımsızdır. Link yalnızca Devam Et adımında kontrol edilir.
       // Aynı cihazda kayıt bilgileri duruyorsa yeni hesap yerine mevcut kısıtlı hesabı göster.
@@ -4274,8 +4299,8 @@ function MainApp() {
         ['sgm_registration_token', 'sgm_registration_credentials', 'sgm_registration_form_url', 'sgm_registration_form_opened'].forEach(key => sessionStorage.removeItem(key));
         setRegistrationPending(''); setRegistrationResult(null);
         setRegistrationFormUrl(''); setRegistrationFormOpened(false);
-        const oldSession = (() => { try { return JSON.parse(localStorage.getItem('sgm_student_session') || 'null'); } catch { return null; } })();
-        if (oldSession?.userId === saved.userId) localStorage.removeItem('sgm_student_session');
+        const oldSession = (() => { try { return JSON.parse(sessionStorage.getItem('sgm_student_session') || 'null'); } catch { return null; } })();
+        if (oldSession?.userId === saved.userId) sessionStorage.removeItem('sgm_student_session');
       }
       if (db && !user) {
         if (!auth) throw new Error('Firebase oturumu başlatılamadı.');
@@ -4288,7 +4313,7 @@ function MainApp() {
           registrationAuthUser = null;
           setCurrentUser(null); setSelectedDeskId(null); setDeskSelectionDeadline(null);
         }
-        if (!registrationAuthUser) registrationAuthUser = (await signInAnonymously(auth)).user;
+        if (!registrationAuthUser) registrationAuthUser = (await signInTabAnonymously()).user;
         // İstek kaybolursa tekrar aynı yeni oturum kullanılır; ikinci hesap açılmaz.
         sessionStorage.removeItem('sgm_registration_new_person');
         verifiedAdminUidRef.current = null;
@@ -4463,11 +4488,11 @@ function MainApp() {
         return showMessage('Giriş Hatası', payload?.message || `Öğrenci giriş servisi HTTP ${response.status} döndürdü. Bağlantıyı kontrol edip tekrar deneyin.`, 'danger');
       }
       if (!auth) throw new Error('Firebase ayarları bulunamadı.');
-      const credential = await signInWithCustomToken(auth, payload.token);
+      const credential = await signInTabWithCustomToken(payload.token);
       const tokenResult = await credential.user.getIdTokenResult(true);
       if (tokenResult.claims.role !== 'student' || credential.user.uid !== payload.user.id) {
         await signOut(auth);
-        await signInAnonymously(auth);
+        await signInTabAnonymously();
         throw new Error('Öğrenci oturumu doğrulanamadı.');
       }
       const user = normalizeRemoteUsers([payload.user], settingsRef.current)[0];
@@ -4488,7 +4513,7 @@ function MainApp() {
     };
     usersRef.current = [updatedUser];
     setUsers([updatedUser]);
-    localStorage.setItem('sgm_student_session', JSON.stringify({ userId: updatedUser.id }));
+    sessionStorage.setItem('sgm_student_session', JSON.stringify({ userId: updatedUser.id }));
     setCurrentUser(updatedUser);
     setSelectedDeskId(pendingIsValid ? Number(user.pendingDeskId) : null);
     setDeskSelectionDeadline(pendingIsValid ? Number(user.pendingDeskDeadline) : null);
@@ -4516,7 +4541,7 @@ function MainApp() {
 
   const logoutStudent = async () => {
     addLog('OGRENCI_CIKIS', 'Kullanıcı kendi isteğiyle çıkış yaptı.', null, currentUser?.id);
-    localStorage.removeItem('sgm_student_session');
+    sessionStorage.removeItem('sgm_student_session');
     setCurrentUser(null);
     setView('role_select');
     setUsers([]);
@@ -4526,7 +4551,7 @@ function MainApp() {
     await appendChainRef.current.catch(() => {});
     if (auth) {
       await signOut(auth);
-      await signInAnonymously(auth);
+      await signInTabAnonymously();
     }
   };
 
@@ -5798,7 +5823,7 @@ function MainApp() {
 
     // Aynı cihazda silinen kullanıcı açıksa oturumunu da kapat.
     if (currentUser?.id && existingIds.has(String(currentUser.id))) {
-      localStorage.removeItem('sgm_student_session');
+      sessionStorage.removeItem('sgm_student_session');
       setCurrentUser(null);
       setSelectedDeskId(null);
       setDeskSelectionDeadline(null);
@@ -6405,7 +6430,7 @@ function MainApp() {
       let newUser;
       if (db) {
         if (!auth) throw new Error('Firebase yönetici oturumu bulunamadı.');
-        await auth.authStateReady();
+        await ensureTabAuthPersistence(); await auth.authStateReady();
         const adminUser = auth.currentUser;
         if (!adminUser) throw new Error('Yönetici paneline yeniden giriş yapın.');
         const tokenResult = await adminUser.getIdTokenResult(true);
@@ -7579,7 +7604,7 @@ function MainApp() {
                     return;
                   }
                   if (!auth) throw new Error('Firebase ayarları bulunamadı.');
-                  const credential = await signInWithCustomToken(auth, payload.token);
+                  const credential = await signInTabWithCustomToken(payload.token);
                   const claims = await credential.user.getIdTokenResult(true);
                   if (auth.currentUser?.uid !== credential.user.uid || claims.claims.admin !== true) throw new Error('Yönetici yetkisi doğrulanamadı.');
                   verifiedAdminUidRef.current = credential.user.uid;
@@ -7653,7 +7678,7 @@ function MainApp() {
                   <div className="p-3 border-t border-slate-800">
                     <button
                       type="button"
-                      onClick={async () => { addLog('ADMIN_CIKIS', 'Yönetici panelinden çıkış yapıldı.'); await appendChainRef.current; setAdminAuthorized(false); setView('role_select'); if (auth) { await signOut(auth); await signInAnonymously(auth); } }}
+                      onClick={async () => { addLog('ADMIN_CIKIS', 'Yönetici panelinden çıkış yapıldı.'); await appendChainRef.current; setAdminAuthorized(false); setView('role_select'); if (auth) { await signOut(auth); await signInTabAnonymously(); } }}
                       className="w-full px-4 py-3 rounded-xl text-sm font-bold flex items-center gap-3 text-slate-300 hover:bg-red-500/10 hover:text-red-300 transition-colors"
                     >
                       <LogOut className="w-5 h-5" />
@@ -7887,7 +7912,7 @@ function MainApp() {
                      const formData = new FormData(e.currentTarget);
                      if (db) {
                        try {
-                         await auth.authStateReady();
+                         await ensureTabAuthPersistence(); await auth.authStateReady();
                          const liveUser = auth.currentUser;
                          if (!liveUser) throw new Error('Yönetici oturumu bulunamadı.');
                          const token = await liveUser.getIdTokenResult(true);
