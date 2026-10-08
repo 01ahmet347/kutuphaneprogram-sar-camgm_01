@@ -1,3 +1,5 @@
+// EK DÜZELTME: Hesap onayı/kısıt değişikliği sunucu transaction'ı tamamlanmadan başarılı sayılmaz.
+// Yeni kayıtlar onay beklemeye devam eder; yönetici açıkça onayladığında öğrenci güncellenir.
 // EK DÜZELTME: Eski cihaz kayıt engeli kaldırıldı; sunucu kimlik doğrulaması korunur.
 // Tekli/toplu kısıt kaldırmada ihbar yetkisi açılır; eski aktif hesaplar YP'de onarılır.
 // 2026-10-08 EK SENKRONİZASYON DÜZELTMELERİ:
@@ -39,7 +41,7 @@ import {
 } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, signOut } from 'firebase/auth';
-import { getFirestore, doc, setDoc, onSnapshot, runTransaction, collection, getDoc, getDocs, query, orderBy, limit, startAfter, deleteDoc } from 'firebase/firestore';
+import { getFirestore, doc, setDoc, onSnapshot, runTransaction, collection, getDoc, getDocs, getDocFromServer, query, orderBy, limit, startAfter, deleteDoc } from 'firebase/firestore';
 
 import { getMessaging, getToken, onMessage, isSupported as isMessagingSupported } from 'firebase/messaging';
 import { mergePendingRows, nonConflictingPatch, atomicFieldPatch, changedFields, mapLimited, sessionCanRestore } from './src/sync-core.js';
@@ -1861,6 +1863,8 @@ function MainApp() {
     logs: false, violations: false, feedback: false
   });
   const granularWriteTimerRef = useRef(null);
+  const adminUserSaveInFlightRef = useRef(false);
+  const [adminUserSavingId, setAdminUserSavingId] = useState(null);
   const granularWriteChainRef = useRef(Promise.resolve());
   const quotaBackoffUntilRef = useRef(0);
   const deskQrRepairInFlightRef = useRef(false);
@@ -2139,6 +2143,73 @@ function MainApp() {
     setLayoutElements(data.layoutElements);
   };
 
+  // Hesap düzenleme başarılı mesajı yalnızca sunucu işlemi tamamlanınca gösterilir.
+  const saveAdminUserChanges = async (original, desired) => {
+    if (adminUserSaveInFlightRef.current) throw new Error('Önce devam eden hesap kaydının tamamlanmasını bekleyin.');
+    if (db && (!adminAuthorized || !fbUser || !navigator.onLine)) throw new Error('Hesap değişikliğini kaydetmek için çevrimiçi yönetici oturumu gerekir.');
+    adminUserSaveInFlightRef.current = true;
+    setAdminUserSavingId(original.id);
+    clearTimeout(granularWriteTimerRef.current);
+    try {
+      // Önceden sıraya alınmış yazmalar bu açık yönetici işlemini geri alamaz.
+      await granularWriteChainRef.current.catch(() => {});
+      const patch = Object.fromEntries(Object.entries(desired).filter(([key, value]) => key !== 'id' && stableJson(value) !== stableJson(original[key])));
+      // Hesap yetkileri tek bir tutarlı grup olarak yazılır.
+      for (const key of ['blocked', 'pendingApproval', 'restrictedUntil', 'restrictionReason', 'canReport']) {
+        if (desired[key] !== undefined) patch[key] = desired[key];
+      }
+      const result = db ? await runTransaction(db, async tx => {
+        const userRef = getLiveDoc('sgmUsers', original.id);
+        const tombstoneRef = getLiveDoc('sgmDeletedUsers', original.id);
+        const [snapshot, tombstone] = await Promise.all([tx.get(userRef), tx.get(tombstoneRef)]);
+        if (!snapshot.exists() || tombstone.exists()) throw new Error('Hesap silinmiş; eski kayıt yeniden oluşturulamaz.');
+        const remote = snapshot.data();
+        tx.set(userRef, patch, {merge: true});
+        // Masa, mola ve bildirim alanları sunucudaki güncel hâliyle korunur.
+        return {...remote, ...patch, id: original.id};
+      }) : desired;
+      applyCloudRows({user: result});
+      localStorage.setItem('sgm_users', JSON.stringify(usersRef.current));
+      return result;
+    } finally {
+      adminUserSaveInFlightRef.current = false;
+      setAdminUserSavingId(null);
+    }
+  };
+
+  const refreshStudentProfile = async () => {
+    const id = currentUser?.id;
+    if (!db || !id || auth?.currentUser?.uid !== id) return;
+    try {
+      const snapshot = await getDocFromServer(getLiveDoc('sgmUsers', id));
+      if (auth?.currentUser?.uid !== id) return;
+      if (!snapshot.exists()) {
+        serverDeletedUserIdsRef.current.add(String(id));
+        usersRef.current = []; setUsers([]);
+        return;
+      }
+      const user = {...snapshot.data(), id};
+      applyCloudRows({user});
+      setUsersSyncError('');
+      localStorage.setItem('sgm_users', JSON.stringify(usersRef.current));
+    } catch (error) {
+      setUsersSyncError('Hesap durumu sunucudan yenilenemedi. Bağlantı ve hesap erişimini kontrol edin.');
+      handleFirestoreQuotaError(error);
+    }
+  };
+  useEffect(() => {
+    if (!currentUser?.id || !fbUser || fbUser.uid !== currentUser.id) return;
+    const refresh = () => { if (!document.hidden) refreshStudentProfile(); };
+    window.addEventListener('focus', refresh);
+    window.addEventListener('online', refresh);
+    document.addEventListener('visibilitychange', refresh);
+    return () => {
+      window.removeEventListener('focus', refresh);
+      window.removeEventListener('online', refresh);
+      document.removeEventListener('visibilitychange', refresh);
+    };
+  }, [currentUser?.id, fbUser]);
+
   const adminDataMode = view === 'admin_dash' && adminAuthorized;
 
   useEffect(() => {
@@ -2412,7 +2483,7 @@ function MainApp() {
       localStorage.setItem('sgm_layout', JSON.stringify(layoutElements));
     } catch(e) {}
 
-    if (!isDataLoaded || !fbUser || !db || !granularSyncReadyRef.current) return;
+    if (!isDataLoaded || !fbUser || !db || !granularSyncReadyRef.current || adminUserSaveInFlightRef.current) return;
     if (Date.now() < Number(quotaBackoffUntilRef.current || 0)) return;
 
     // Hızlı art arda gelen state değişikliklerini normalde 900ms içinde tek turda birleştir.
@@ -5751,6 +5822,22 @@ function MainApp() {
       case 'message_user':
         openAdminDeskMessage(deskId, userId);
         break;
+      case 'approve_account': {
+        const user = usersRef.current.find(u => u.id === userId);
+        if (!user) return showMessage('Hesap Bulunamadı', 'Kullanıcı artık listede bulunmuyor.', 'warning');
+        pushUndoSnapshot('Hesap onayı ve kısıt kaldırma');
+        try {
+          await saveAdminUserChanges(user, {...user, blocked: false, pendingApproval: false,
+            restrictedUntil: 0, restrictionReason: '', canReport: true,
+            reportPermissionPolicyVersion: 1, reportPermissionRestrictionUntil: 0});
+          addLog('ADMIN_HESAP_ONAYLANDI', 'Hesap sorumlu tarafından onaylandı; hesap kısıtı kaldırıldı ve ihbar yetkisi açıldı.', null, userId);
+          showMessage('Hesap Onaylandı', 'Onay sunucuya kaydedildi. Öğrenci ekranı güncel hesap durumunu alabilir.', 'success');
+        } catch (error) {
+          handleFirestoreQuotaError(error);
+          showMessage('Onay Kaydedilemedi', error.message, 'warning');
+        }
+        break;
+      }
       case 'toggle_block':
         if (userId) openAdminUserEditor(userId);
         break;
@@ -5868,7 +5955,7 @@ function MainApp() {
         <p className="text-xs font-semibold text-slate-600">Son 7 gündeki ihlal: {(user.violationHistory || []).filter(t => t > Date.now()-WEEK_MS).length}</p>
         <form
           key={`admin-user-edit-${user.id}`}
-          onSubmit={(e) => {
+          onSubmit={async (e) => {
             e.preventDefault();
             const formData = new FormData(e.currentTarget);
 
@@ -5911,12 +5998,12 @@ function MainApp() {
             }
 
             pushUndoSnapshot('Kullanıcı bilgilerini düzenleme');
-            usersRef.current = (usersRef.current || []).map(u => u.id === user.id ? updatedUser : u);
-            setUsers(prev => Array.isArray(prev)
-              ? prev.map(u => u.id === user.id ? updatedUser : u)
-              : [updatedUser]
-            );
-            setCurrentUser(prev => prev && prev.id === user.id ? { ...prev, ...updatedUser } : prev);
+            try {
+              await saveAdminUserChanges(user, updatedUser);
+            } catch (error) {
+              handleFirestoreQuotaError(error);
+              return showMessage('Hesap Kaydedilemedi', error.message, 'warning');
+            }
 
             addLog(
               'ADMIN_KULLANICI_GUNCELLE',
@@ -6026,7 +6113,7 @@ function MainApp() {
             <button type="button" onClick={() => { setAdminUserEditId(null); closeMessage(); }} className="flex-1 py-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl font-bold">
               Vazgeç
             </button>
-            <button type="submit" className="flex-1 py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-bold shadow-md flex items-center justify-center gap-2">
+            <button type="submit" disabled={adminUserSavingId === user.id} className="flex-1 py-3 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-xl font-bold shadow-md flex items-center justify-center gap-2">
               <Save className="w-4 h-4" /> Değişiklikleri Kaydet
             </button>
           </div>
@@ -6287,8 +6374,20 @@ function MainApp() {
     if (action === 'block') next = current.map(u => ids.has(String(u.id)) ? { ...u, blocked: false, restrictedUntil: Date.now() + Math.max(1, Number(bulkRestrictionDays) || 5) * 86400000, restrictionReason: 'Yönetici tarafından toplu süreli kısıtlama' } : u);
     else if (action === 'unblock') next = current.map(u => ids.has(String(u.id)) ? { ...u, blocked: false, pendingApproval: false, restrictedUntil: 0, restrictionReason: '', canReport: true, reportPermissionPolicyVersion: 1, reportPermissionRestrictionUntil: 0 } : u);
 
-    usersRef.current = next;
-    setUsers(next);
+    if (db) {
+      try {
+        for (const desired of next.filter(u => ids.has(String(u.id)))) {
+          const original = current.find(u => u.id === desired.id);
+          await saveAdminUserChanges(original, desired);
+        }
+      } catch (error) {
+        handleFirestoreQuotaError(error);
+        return showMessage('Toplu İşlem Tamamlanamadı', 'Tamamlanan hesaplar kaydedildi; kalanlar için tekrar deneyin. ' + error.message, 'warning');
+      }
+    } else {
+      usersRef.current = next;
+      setUsers(next);
+    }
     setSelectedUserIds([]);
     addLog('ADMIN_TOPLU_KULLANICI', `${ids.size} kullanıcı için ${action} toplu işlemi uygulandı.`);
   };
@@ -7070,6 +7169,7 @@ function MainApp() {
                   <Smartphone className="w-5 h-5" />
                 </button>
 
+                {usersSyncError && <p role="alert" className="text-sm text-amber-800">{usersSyncError}</p>}
                 {myUserObj?.strikes > 0 && (
                    <div className="flex items-center gap-1 text-red-600 text-xs font-bold bg-red-50 border border-red-100 px-3 py-1.5 rounded-full animate-pulse">
                       <AlertTriangle className="w-4 h-4" /> {Number.isFinite(Number(myUserObj.strikes)) ? Number(myUserObj.strikes) : 0}/{Number.isFinite(Number(settings.strikeLimit)) && Number(settings.strikeLimit) > 0 ? Number(settings.strikeLimit) : DEFAULT_SETTINGS.strikeLimit} İhlal
@@ -7082,7 +7182,7 @@ function MainApp() {
             </nav>
 
             <main className="flex-1 max-w-5xl mx-auto w-full p-4 lg:p-6 space-y-6">
-              {studentRestricted && <div className="p-4 bg-amber-50 border border-amber-200 text-amber-900 rounded-2xl"><b>Hesabınız kısıtlı.</b> Masa seçimi, boş masa ihbarı ve dilek / şikayet kapalıdır. {myUserObj?.restrictionReason} Kütüphane sorumlusu gerekli kontrollerden sonra kısıtı kaldırabilir.</div>}
+              {studentRestricted && <div className="p-4 bg-amber-50 border border-amber-200 text-amber-900 rounded-2xl"><b>Hesabınız kısıtlı.</b> Masa seçimi, boş masa ihbarı ve dilek / şikayet kapalıdır. {myUserObj?.restrictionReason} Kütüphane sorumlusu gerekli kontrollerden sonra kısıtı kaldırabilir.<button onClick={refreshStudentProfile} className="block mt-2 px-3 py-2 bg-white border border-amber-300 rounded-lg font-bold">Hesap Durumunu Yenile</button></div>}
               {!studentRestricted && studentDeskWait > 0 && <div className="p-4 bg-blue-50 border border-blue-200 text-blue-900 rounded-2xl"><b>Yeniden masa almak için kalan süre: {formatTime(studentDeskWait)}</b><p>Sistem hatası durumunda yönetici size masa atayabilir.</p></div>}
               {registrationResult && myUserObj?.pendingApproval && <div className="p-4 bg-white border rounded-2xl space-y-2"><p><b>GM özel kodunu yazmayı unutmayın:</b> {myUserObj.specialCode}</p><button disabled={registrationRedirectBusy} onClick={openRegistrationGoogleForm} className="p-3 bg-green-600 text-white rounded-xl">Kayıt formunu aç</button></div>}
               <div className="bg-white rounded-3xl shadow-sm border border-slate-200 overflow-hidden relative">
@@ -7634,7 +7734,7 @@ function MainApp() {
                     <div className="mb-4 space-y-2"><label htmlFor="user-search" className="block font-bold text-slate-700">Kullanıcı Ara</label><input id="user-search" type="search" value={userSearch} onChange={e => setUserSearch(e.target.value)} placeholder="GM Özel Kod, şifre veya ad soyad yazın" className="w-full p-3 border rounded-xl"/><p className="text-xs text-slate-500">Bulunan: {filteredUsers.length} {userSearch && <button onClick={() => setUserSearch('')} className="ml-3 text-blue-700 font-bold">Aramayı temizle</button>}</p></div>
                     <table className="w-full text-left border-collapse text-sm min-w-[1100px]">
                       <thead><tr className="bg-slate-50 text-slate-500 border-b"><th className="p-3"><input type="checkbox" checked={filteredUsers.length > 0 && filteredUsers.every(u => selectedUserIds.includes(u.id))} onChange={e=>setSelectedUserIds(prev=>e.target.checked ? [...new Set([...prev, ...filteredUsers.map(u=>u.id)])] : prev.filter(id=>!filteredUsers.some(u=>u.id===id)))}/></th><th className="p-3">8 Haneli Şifre</th><th className="p-3">GM Özel Kod</th><th className="p-3">Hesap Durumu</th><th className="p-3">Aktif Masa</th><th className="p-3 text-center">İhlal</th><th className="p-3 text-center">İşlemler</th></tr></thead>
-                      <tbody>{filteredUsers.map(u=><tr key={u.id} className="border-b border-slate-100 hover:bg-slate-50"><td className="p-3"><input type="checkbox" checked={selectedUserIds.includes(u.id)} onChange={e=>setSelectedUserIds(prev=>e.target.checked?[...new Set([...prev,u.id])]:prev.filter(id=>id!==u.id))}/></td><td className="p-3 font-mono font-bold tracking-widest">{u.pin}</td><td className="p-3 font-mono font-black text-indigo-700 tracking-widest"><button onClick={() => openAdminUserEditor(u.id)} className="hover:underline">{u.specialCode || '-'}</button></td><td className="p-3">{u.blocked ? "Kısıtlı (Engelli)" : u.pendingApproval ? "Onay Bekliyor" : isRestricted(u, now) ? "Kısıtlı" : "Aktif"}<div className="text-xs text-slate-500 mt-1">İhbar: {isRestricted(u, now) ? "Hesap kısıtlı" : settings.reportsEnabled === false ? "Sistem genelinde kapalı" : u.canReport === false ? "Yetki kapalı" : "Açık"}</div></td><td className="p-3">{u.activeDeskId?`Masa ${u.activeDeskId}`:'Yok'}</td><td className="p-3 text-center text-red-600 font-bold">{u.strikes}</td><td className="p-3 text-center"><div className="flex flex-wrap justify-center gap-2"><button onClick={()=>openAdminUserEditor(u.id)} className="px-3 py-1 bg-blue-50 text-blue-700 rounded font-bold">Düzenle</button><button onClick={()=>handleAdminAction('toggle_block',null,u.id)} className="px-3 py-1 bg-slate-100 rounded font-bold">{isRestricted(u)?'Kısıtlı':'Kısıt Ver'}</button><button onClick={()=>handleAdminAction('delete_user',null,u.id)} className="px-3 py-1 bg-red-50 text-red-600 rounded font-bold">Sil</button></div></td></tr>)}</tbody>
+                      <tbody>{filteredUsers.map(u=><tr key={u.id} className="border-b border-slate-100 hover:bg-slate-50"><td className="p-3"><input type="checkbox" checked={selectedUserIds.includes(u.id)} onChange={e=>setSelectedUserIds(prev=>e.target.checked?[...new Set([...prev,u.id])]:prev.filter(id=>id!==u.id))}/></td><td className="p-3 font-mono font-bold tracking-widest">{u.pin}</td><td className="p-3 font-mono font-black text-indigo-700 tracking-widest"><button onClick={() => openAdminUserEditor(u.id)} className="hover:underline">{u.specialCode || '-'}</button></td><td className="p-3">{u.blocked ? "Kısıtlı (Engelli)" : u.pendingApproval ? "Onay Bekliyor" : isRestricted(u, now) ? "Kısıtlı" : "Aktif"}<div className="text-xs text-slate-500 mt-1">İhbar: {isRestricted(u, now) ? "Hesap kısıtlı" : settings.reportsEnabled === false ? "Sistem genelinde kapalı" : u.canReport === false ? "Yetki kapalı" : "Açık"}</div></td><td className="p-3">{u.activeDeskId?`Masa ${u.activeDeskId}`:'Yok'}</td><td className="p-3 text-center text-red-600 font-bold">{u.strikes}</td><td className="p-3 text-center"><div className="flex flex-wrap justify-center gap-2"><button onClick={()=>openAdminUserEditor(u.id)} className="px-3 py-1 bg-blue-50 text-blue-700 rounded font-bold">Düzenle</button>{isRestricted(u, now) && <button disabled={adminUserSavingId !== null} onClick={()=>handleAdminAction('approve_account',null,u.id)} className="px-3 py-1 bg-green-50 text-green-700 rounded font-bold disabled:opacity-50">Hesabı Onayla / Kısıtı Kaldır</button>}<button onClick={()=>handleAdminAction('toggle_block',null,u.id)} className="px-3 py-1 bg-slate-100 rounded font-bold">{isRestricted(u)?'Kısıtlı':'Kısıt Ver'}</button><button onClick={()=>handleAdminAction('delete_user',null,u.id)} className="px-3 py-1 bg-red-50 text-red-600 rounded font-bold">Sil</button></div></td></tr>)}</tbody>
                     </table>
                   </div>
                 </div>
