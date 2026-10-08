@@ -1,3 +1,4 @@
+// 2026-10-08: Giriş bağlantısı kaldırıldı; YP isimsiz otomatik kayıt; rezervasyon iptali; sabit QR ve QR yedek sekmesi.
 // EK DÜZELTME: Firebase ve öğrenci oturumları sekmeye özeldir; yetkisiz yönetici görünümü girişe döner.
 // EK DÜZELTME: Ayar kaydı ihbarı kapatmaz; yönetici listesi oturum kapsamında dinlenir.
 // Sunucu ayarları tüm açık ekranlara anında uygulanır; mola ihbarı engellenir.
@@ -46,7 +47,7 @@ import {
 } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { getAuth, setPersistence, browserSessionPersistence, signInAnonymously, signInWithCustomToken, onAuthStateChanged, signOut } from 'firebase/auth';
-import { getFirestore, doc, setDoc, onSnapshot, runTransaction, collection, getDoc, getDocs, getDocFromServer, query, orderBy, limit, startAfter, deleteDoc } from 'firebase/firestore';
+import { getFirestore, doc, setDoc, onSnapshot, runTransaction, collection, getDoc, getDocs, getDocsFromServer, getDocFromServer, query, orderBy, limit, startAfter, deleteDoc } from 'firebase/firestore';
 
 import { getMessaging, getToken, onMessage, isSupported as isMessagingSupported } from 'firebase/messaging';
 import { mergePendingRows, nonConflictingPatch, atomicFieldPatch, changedFields, mapLimited, sessionCanRestore } from './src/sync-core.js';
@@ -114,6 +115,34 @@ const formatDateTime = (date) => {
 };
 
 const generateId = () => Math.random().toString(36).substr(2, 9);
+// Yeni / eksik masaların QR değeri masa kimliğinden türetilir; yeniden açılışta değişmez.
+// Önceden basılmış QR kodları normalizeDeskQrRows tarafından aynen korunur.
+const getStaticDeskQrCode = id => {
+  let hash = 0;
+  for (const char of String(Number(id))) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+  return 'QR-' + Number(id) + '-SGM' + String(10000000 + hash % 90000000);
+};
+
+const validateQrBackup = (value, expectedAppId) => {
+  if (!value || value.format !== 'sgm-desk-qr-backup' || value.version !== 1 ||
+      !Array.isArray(value.desks) || !value.desks.length || value.desks.length > 400) {
+    throw new Error('Geçerli bir SGM QR yedek dosyası seçin (en fazla 400 masa).');
+  }
+  if (String(value.appId || '') !== String(expectedAppId || 'local')) {
+    throw new Error('Bu QR yedeği farklı bir kurulumdan alınmış. Bu sistemin yedeğini seçin.');
+  }
+  const ids = new Set(), codes = new Set();
+  return value.desks.map(row => {
+    const id = Number(row?.id);
+    const qrCode = row?.qrCode;
+    if (!Number.isSafeInteger(id) || id < 1 || ids.has(id) || typeof qrCode !== 'string' ||
+        qrCode.length > 256 || !new RegExp('^QR-' + id + '-[A-Za-z0-9_-]+$').test(qrCode) || codes.has(qrCode)) {
+      throw new Error('Yedekte geçersiz / tekrarlanan masa veya QR kodu var. Hiçbir değişiklik yapılmadı.');
+    }
+    ids.add(id); codes.add(qrCode);
+    return { id, qrCode };
+  });
+};
 
 const getLocalDayKey = (date = new Date()) => {
   const y = date.getFullYear();
@@ -261,7 +290,7 @@ const INITIAL_DESKS = Array.from({ length: 35 }, (_, i) => ({
   reportIssuedAt: null,
   reportVerifiedAt: null,
   sessionStartTime: null,
-  qrCode: 'QR-' + (i + 1) + '-' + generateId(),
+  qrCode: getStaticDeskQrCode(i + 1),
 }));
 
 const legacyIdentity = (id) => { let h=0; for(const c of String(id)) h=(h*31+c.charCodeAt(0))>>>0; return String(10000000+h%90000000); };
@@ -317,7 +346,7 @@ const normalizeDeskQrRows = rows => (Array.isArray(rows) ? rows : [])
   .filter(desk => desk && Number.isInteger(Number(desk.id)) && Number(desk.id) > 0)
   .map(desk => ({ ...desk, id: Number(desk.id),
     // Mevcut QR aynen korunur. Eksik kod tüm cihazlarda aynı sonuçla tamamlanır.
-    qrCode: desk.qrCode || ('QR-' + Number(desk.id) + '-SGM' + legacyIdentity(Number(desk.id)))
+    qrCode: desk.qrCode || getStaticDeskQrCode(desk.id)
   }));
 
 // Ana Salonun 35 masasını tamamlar; mevcut oturumlar ve QR kodları korunur.
@@ -1147,6 +1176,8 @@ function MainApp() {
   // ÖĞRENCİ MASA SEÇİMİ: Öğrenci önce masasını seçer, ardından 5 dakika içinde aynı masanın QR kodunu okutmalıdır.
   const [selectedDeskId, setSelectedDeskId] = useState(null);
   const [deskSelectionDeadline, setDeskSelectionDeadline] = useState(null);
+  const [deskCancellationBusy, setDeskCancellationBusy] = useState(false);
+  const deskCancellationRef = useRef(false);
   const deviceId = useMemo(() => getDeviceId(), []);
   const [userLocation, setUserLocation] = useState(() => localStorage.getItem('sgm_last_location') || "Konum Aranıyor...");
 
@@ -1157,6 +1188,10 @@ function MainApp() {
   const [selectedUserIds, setSelectedUserIds] = useState([]);
   // Toplu QR ekranında hangi masaların alınacağını/yazdırılacağını seçer.
   const [selectedQrDeskIds, setSelectedQrDeskIds] = useState([]);
+  const [qrBackupPreview, setQrBackupPreview] = useState(null);
+  const [qrBackupBusy, setQrBackupBusy] = useState(false);
+  const qrBackupOperationRef = useRef(false);
+  const qrBackupInputRef = useRef(null);
   const [userSearch, setUserSearch] = useState('');
   const [archiveLoading, setArchiveLoading] = useState(false);
   const [archivedLogs, setArchivedLogs] = useState([]);
@@ -2089,7 +2124,7 @@ function MainApp() {
   };
 
   const repairDeskQrData = async (notify = true) => {
-    if (deskQrRepairInFlightRef.current) return;
+    if (deskQrRepairInFlightRef.current || qrBackupOperationRef.current) return;
     if (db && (!fbUser || !adminAuthorized)) {
       if (notify) showMessage('Bağlantı Bekleniyor', 'Masa onarımı için yönetici bağlantısını bekleyin.', 'warning');
       return;
@@ -4218,34 +4253,48 @@ function MainApp() {
   };
 
   const cancelDeskSelection = async (reason = 'Öğrenci masa seçimini iptal etti.') => {
-    if (!currentUser) return;
-    const oldDeskId = selectedDeskId;
-    if (oldDeskId && db) {
-      try {
+    if (!currentUser || deskCancellationRef.current || deskActionInFlightRef.current) return;
+    const userId = currentUser.id;
+    const freshUser = (usersRef.current || []).find(u => u.id === userId);
+    const guard = pendingReservationGuardRef.current;
+    const reservedDesk = (desksRef.current || []).find(d => d.pendingOccupant === userId);
+    const oldDeskId = Number(selectedDeskId || freshUser?.pendingDeskId || currentUser.pendingDeskId ||
+      (guard?.userId === userId ? guard.deskId : 0) || reservedDesk?.id || 0);
+    deskCancellationRef.current = true;
+    deskActionInFlightRef.current = true;
+    setDeskCancellationBusy(true);
+    try {
+      if (oldDeskId && db) {
+        if (!fbUser || !navigator.onLine) throw new Error('İptal için sunucu bağlantısı gerekli. Bağlantı kurulunca tekrar deneyin.');
         const result = await runStudentDeskAction('cancel', { deskId: oldDeskId });
+        // Başarı cevabı olmadan yerel rezervasyon kaldırılmaz.
         if (result) applyCloudRows(result);
-      } catch (error) {
-        handleFirestoreQuotaError(error);
-        showMessage('Rezervasyon İptal Edilemedi', error.message, 'warning');
-        return;
       }
+      if (pendingReservationGuardRef.current?.userId === userId) pendingReservationGuardRef.current = null;
+      criticalDeskMutationRef.current = true;
+      const nextDesks = (desksRef.current || []).map(d => Number(d.id) === oldDeskId && d.pendingOccupant === userId
+        ? { ...d, pendingOccupant: null, pendingDeskRole: null, pendingDeskDeadline: null } : d);
+      const nextUsers = (usersRef.current || []).map(u => u.id === userId
+        ? { ...u, pendingDeskId: null, pendingDeskDeadline: null } : u);
+      // Ref'ler aynı anda güncellenir; yeniden masa seçimi eski kilide takılmaz.
+      desksRef.current = nextDesks; usersRef.current = nextUsers;
+      setDesks(nextDesks); setUsers(nextUsers);
+      setSelectedDeskId(null); setDeskSelectionDeadline(null);
+      setCurrentUser(prev => prev?.id === userId ? { ...prev, pendingDeskId: null, pendingDeskDeadline: null } : prev);
+      setScannerConfig({ isOpen: false, mode: null, title: '' });
+      if (oldDeskId) addLog('MASA_SECIM_IPTAL', reason, oldDeskId, userId);
+    } catch (error) {
+      handleFirestoreQuotaError(error);
+      showMessage('Rezervasyon İptal Edilemedi', error.message, 'warning');
+    } finally {
+      deskCancellationRef.current = false;
+      deskActionInFlightRef.current = false;
+      setDeskCancellationBusy(false);
     }
-    if (pendingReservationGuardRef.current?.userId === currentUser.id) pendingReservationGuardRef.current = null;
-    criticalDeskMutationRef.current = true;
-    setSelectedDeskId(null);
-    setDeskSelectionDeadline(null);
-    if (oldDeskId) {
-      setDesks(prev => Array.isArray(prev) ? prev.map(d => d.id === oldDeskId && d.pendingOccupant === currentUser.id ? {
-        ...d, pendingOccupant: null, pendingDeskRole: null, pendingDeskDeadline: null
-      } : d) : []);
-    }
-    setUsers(prev => Array.isArray(prev) ? prev.map(u => u.id === currentUser.id ? { ...u, pendingDeskId: null, pendingDeskDeadline: null } : u) : []);
-    setCurrentUser(prev => prev ? { ...prev, pendingDeskId: null, pendingDeskDeadline: null } : prev);
-    if (oldDeskId) addLog('MASA_SECIM_IPTAL', reason, oldDeskId, currentUser.id);
   };
 
   useEffect(() => {
-    if (!currentUser || !selectedDeskId || !deskSelectionDeadline) return;
+    if (!currentUser || !selectedDeskId || !deskSelectionDeadline || deskCancellationRef.current) return;
     if (now < deskSelectionDeadline) return;
 
     const expiredDeskId = selectedDeskId;
@@ -4342,7 +4391,7 @@ function MainApp() {
             // Aynı doğrulanmış anonim UID kullanılır; 401'de yetki atlanmaz.
             const tokenResult = await registrationAuthUser.getIdTokenResult(true);
             if (auth.currentUser?.uid !== registrationAuthUser.uid) throw new Error('Kayıt sırasında oturum değişti. Kayıt ekranından tekrar deneyin.');
-            if (tokenResult.claims.firebase?.sign_in_provider !== 'anonymous') throw new Error('Anonim kayıt oturumu doğrulanamadı. Başka öğrenci için yeni kayıt düğmesini kullanın.');
+            if (tokenResult.claims.firebase?.sign_in_provider !== 'anonymous') throw new Error('Anonim kayıt oturumu doğrulanamadı. Kayıt ekranını yeniden açıp tekrar deneyin.');
             response = await fetch('/api/student-register', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenResult.token}` },
@@ -5980,13 +6029,14 @@ function MainApp() {
         break;
       }
       case 'regenerate_qr':
-        const newQR = 'QR-' + deskId + '-' + generateId();
+        const existingQR = (desksRef.current || []).find(d => Number(d.id) === Number(deskId))?.qrCode;
+        const newQR = existingQR || getStaticDeskQrCode(deskId);
         const updatedQrDesks = (desksRef.current || []).map(d => Number(d.id) === Number(deskId) ? { ...d, qrCode: newQR } : d);
         desksRef.current = updatedQrDesks;
         criticalDeskMutationRef.current = true;
         setDesks(updatedQrDesks);
-        addLog('ADMIN_MÜDAHALE', `Masa ${deskId} QR kodu yenilendi.`, deskId);
-        showMessage("Başarılı", "Masanın QR kodu yenilendi.", "success");
+        addLog('ADMIN_MÜDAHALE', `Masa ${deskId} sabit QR kodu kontrol edildi; mevcut kod korundu.`, deskId);
+        showMessage("Başarılı", "Masanın sabit QR kodu hazır. Mevcut kod değiştirilmedi.", "success");
         break;
     }
   };
@@ -6244,7 +6294,7 @@ function MainApp() {
           </div>
           
           <div className="flex flex-col items-center justify-center p-4 bg-white border border-slate-200 rounded-xl shadow-sm relative">
-             <button onClick={() => { closeMessage(); setTimeout(() => handleAdminAction('regenerate_qr', liveDesk.id), 200); }} className="absolute top-2 right-2 p-1.5 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-lg text-xs font-bold transition-colors shadow-sm" title="QR Kodunu Yenile"><RefreshCw className="w-4 h-4"/></button>
+             <button onClick={() => { closeMessage(); setTimeout(() => handleAdminAction('regenerate_qr', liveDesk.id), 200); }} className="absolute top-2 right-2 p-1.5 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-lg text-xs font-bold transition-colors shadow-sm" title="Sabit QR Kodunu Kontrol Et"><RefreshCw className="w-4 h-4"/></button>
              <p className="text-sm font-bold text-slate-600 mb-1">Masa {liveDesk.id} QR Kodu</p>
              <p className="text-xs text-slate-400 mb-3">Bu QR kod öğrencinin seçtiği masayı doğrulamak için kullanılır.</p>
              {liveDesk.qrCode ? (
@@ -6420,10 +6470,12 @@ function MainApp() {
 
   const createAutomaticUser = async () => {
     if (adminCreatingUser) return;
-    const name = window.prompt('Yeni kişinin gerçek adını ve soyadını yazın:');
-    if (!name?.trim()) return;
-    const current = usersRef.current || [];
-    if (current.some(u => cleanNameFormat(u.name) === cleanNameFormat(name))) return showMessage('Kayıt Zaten Var', 'Bu kişi için yeniden GM Özel Kod oluşturulamaz. Mevcut kaydı kontrol edin.', 'warning');
+    // Aynı başarısız isteği tekrar denemek ikinci bir hesap oluşturmaz.
+    if (!adminCreateRequestRef.current) {
+      const requestId = crypto.randomUUID ? crypto.randomUUID() : 'ADMIN-' + Date.now() + '-' + generateId();
+      adminCreateRequestRef.current = { name: 'Yeni Kayıt • ' + requestId, requestId };
+    }
+    const name = adminCreateRequestRef.current.name;
     setAdminCreatingUser(true);
     try {
       pushUndoSnapshot('Yeni kullanıcı oluşturma');
@@ -6735,6 +6787,85 @@ function MainApp() {
     e.target.value = ''; 
   };
 
+
+  const downloadQrFile = (content, filename, type) => {
+    const url = URL.createObjectURL(new Blob([content], { type }));
+    const link = document.createElement('a');
+    link.href = url; link.download = filename;
+    document.body.appendChild(link); link.click(); link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  };
+
+  const exportQrBackup = async (asHtml = false) => {
+    if (qrBackupOperationRef.current || deskQrRepairInFlightRef.current) return;
+    qrBackupOperationRef.current = true; setQrBackupBusy(true);
+    try {
+      if (db && (!adminAuthorized || !fbUser || !navigator.onLine)) throw new Error('QR yedeği için yönetici bağlantısı gerekli.');
+      // Yedek sunucunun güncel kodlarından alınır, eski cihaz önbelleğinden değil.
+      const rows = db ? (await getDocsFromServer(getLiveCollection('sgmDesks'))).docs.map(s => ({ ...s.data(), id: Number(s.id) })) : desksRef.current;
+      const backup = { format: 'sgm-desk-qr-backup', version: 1, appId: appId || 'local',
+        createdAt: new Date().toISOString(), desks: (rows || []).map(d => ({ id: Number(d.id), qrCode: d.qrCode })).sort((a,b) => a.id-b.id) };
+      validateQrBackup(backup, appId);
+      if (asHtml) {
+        const cards = backup.desks.map(d => '<article><h2>Masa ' + d.id + '</h2>' + getDeskQrSvg(d) + '<p>' + escapeHtml(d.qrCode) + '</p></article>').join('');
+        const html = '<!doctype html><html lang="tr"><head><meta charset="UTF-8"><title>SGM Sabit Masa QR Kodları</title><style>body{font-family:Arial;background:white;color:#111;margin:24px}main{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px}article{text-align:center;border:1px solid #bbb;padding:20px;break-inside:avoid}svg{width:180px;height:180px}p{font-size:11px;overflow-wrap:anywhere}@media print{main{grid-template-columns:repeat(3,1fr)}} </style></head><body><h1>SGM Sabit Masa QR Kodları</h1><p>Bu dosyayı çevrimdışı açıp tarayıcınızdan yazdırabilirsiniz. Geri yükleme için JSON yedeğini kullanın.</p><main>' + cards + '</main></body></html>';
+        downloadQrFile(html, 'SGM-Tum-QR-' + getLocalDayKey() + '.html', 'text/html;charset=utf-8');
+      } else downloadQrFile(JSON.stringify(backup, null, 2), 'SGM-QR-Yedek-' + getLocalDayKey() + '.json', 'application/json;charset=utf-8');
+    } catch (error) { handleFirestoreQuotaError(error); showMessage('QR İndirilemedi', error.message, 'warning'); }
+    finally { qrBackupOperationRef.current = false; setQrBackupBusy(false); }
+  };
+
+  const importQrBackup = async event => {
+    const file = event.target.files?.[0]; event.target.value = '';
+    if (!file || qrBackupOperationRef.current) return;
+    qrBackupOperationRef.current = true; setQrBackupBusy(true); setQrBackupPreview(null);
+    try {
+      if (file.size > 1024 * 1024) throw new Error('QR yedeği en fazla 1 MB olabilir.');
+      const value = JSON.parse(await file.text());
+      const rows = validateQrBackup(value, appId);
+      const knownIds = new Set((desksRef.current || []).map(d => Number(d.id)));
+      if (rows.some(d => !knownIds.has(d.id))) throw new Error('Yedekte bu sistemde bulunmayan masalar var. Önce masa listesini kontrol edin.');
+      setQrBackupPreview({ filename: file.name, rows });
+    } catch (error) { showMessage('Yedek Açılamadı', error instanceof SyntaxError ? 'Dosya geçerli bir JSON yedeği değil.' : error.message, 'warning'); }
+    finally { qrBackupOperationRef.current = false; setQrBackupBusy(false); }
+  };
+
+  const restoreQrBackup = async () => {
+    if (!qrBackupPreview || qrBackupOperationRef.current || deskQrRepairInFlightRef.current) return;
+    qrBackupOperationRef.current = true; setQrBackupBusy(true);
+    try {
+      const rows = qrBackupPreview.rows;
+      const qrById = new Map(rows.map(d => [Number(d.id), d.qrCode]));
+      let restored;
+      if (db) {
+        if (!fbUser || !adminAuthorized || !navigator.onLine) throw new Error('Yedeği yüklemek için yönetici bağlantısı gerekli.');
+        // Bütün okuma ve yazmalar tek transaction içinde; hata olursa kısmi geri yükleme olmaz.
+        restored = await runTransaction(db, async tx => {
+          const live = [];
+          for (const row of rows) {
+            const ref = getLiveDoc('sgmDesks', row.id);
+            const snap = await tx.get(ref);
+            if (!snap.exists()) throw new Error('Masa ' + row.id + ' artık bulunmuyor. Hiçbir kod yüklenmedi.');
+            live.push({ ref, row, current: { ...snap.data(), id: row.id } });
+          }
+          for (const item of live) if (item.current.qrCode !== item.row.qrCode) tx.update(item.ref, { qrCode: item.row.qrCode });
+          return live.map(item => ({ ...item.current, qrCode: item.row.qrCode }));
+        });
+        applyCloudRows({ desks: restored });
+      } else {
+        const knownIds = new Set((desksRef.current || []).map(d => Number(d.id)));
+        if (rows.some(d => !knownIds.has(d.id))) throw new Error('Yedekte artık bulunmayan masalar var.');
+        restored = (desksRef.current || []).map(d => qrById.has(Number(d.id)) ? { ...d, qrCode: qrById.get(Number(d.id)) } : d);
+        desksRef.current = restored; setDesks(restored);
+      }
+      try { localStorage.setItem('sgm_desks', JSON.stringify(desksRef.current)); } catch (error) { console.warn('QR önbelleği kaydedilemedi:', error); }
+      sgmQrSvgCache.clear(); setQrBackupPreview(null);
+      addLog('ADMIN_QR_YEDEK_YUKLE', rows.length + ' masanın sabit QR yedeği geri yüklendi.');
+      showMessage('QR Yedeği Yüklendi', rows.length + ' masanın QR kodu geri yüklendi.', 'success');
+    } catch (error) { handleFirestoreQuotaError(error); showMessage('QR Yedeği Yüklenemedi', error.message, 'warning'); }
+    finally { qrBackupOperationRef.current = false; setQrBackupBusy(false); }
+  };
+
   const handleDownloadDeskQR = async (desk) => {
     if (!desk?.qrCode) return showMessage("QR Bulunamadı", `Masa ${desk?.id || ''} için QR kod bulunamadı.`, "warning");
     try {
@@ -6955,7 +7086,7 @@ function MainApp() {
       guestBreakEndTime: null, guestReported: false, guestReportEndTime: null, guestReportIssuedAt: null,
       guestReportVerifiedAt: null, pendingOccupant: null, pendingDeskRole: null, pendingDeskDeadline: null,
       breakEndTime: null, reportEndTime: null, reportIssuedAt: null, reportVerifiedAt: null,
-      sessionStartTime: null, qrCode: 'QR-' + id + '-' + generateId()
+      sessionStartTime: null, qrCode: getStaticDeskQrCode(id)
     }));
     const nextDesks = extraDesks.length ? [...currentDesks, ...extraDesks].sort((a,b)=>a.id-b.id) : currentDesks;
 
@@ -7268,7 +7399,6 @@ function MainApp() {
                 <button type="submit" className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-4 rounded-xl flex items-center justify-center gap-2 shadow-lg shadow-blue-200">Giriş Yap <LogIn className="w-5 h-5" /></button>
                 <button type="button" onClick={()=>{setRegistrationAccepted(false);setRegistrationRulesOpen(true);setShowRules(true);}} className="w-full py-3 border border-blue-300 text-blue-700 rounded-xl font-bold">Kayıt Ol</button>
                 {registrationPending && registrationFormOpened && <p className="text-sm text-blue-700">Kayıt formuna <b>GM özel kodunu yazmayı unutmayın.</b> Formu gönderin; yönetici kontrol ettikten sonra kısıtı kaldıracaktır.</p>}
-                <button type="button" disabled={registrationBusy} onClick={prepareNewStudentRegistration} className="text-sm font-bold text-blue-700 disabled:opacity-50">Başka öğrenci için yeni kayıt</button>
                 {registrationError && <p role="alert" className="text-sm text-red-700">{registrationError}</p>}
                 {registrationResult && <div className="p-4 bg-amber-50 border border-amber-200 rounded-xl space-y-3">
                   <div className="font-black text-amber-900 text-lg">Önemli: Bu bilgileri unutmayın ve kaybetmeyin!</div>
@@ -7388,7 +7518,7 @@ function MainApp() {
                             <button disabled={studentRestricted || studentDeskWait > 0} onClick={() => setScannerConfig({ isOpen: true, mode: 'claim', title: `Masa ${selectedDeskId} QR Doğrulaması` })} className="flex-1 bg-blue-600 text-white px-5 py-4 rounded-xl hover:bg-blue-700 shadow-md flex items-center justify-center gap-2 font-bold">
                               <QrCode className="w-5 h-5"/> Seçilen Masanın QR'ını Okut
                             </button>
-                            <button onClick={() => cancelDeskSelection()} className="px-5 py-4 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-xl font-bold">Seçimi İptal Et</button>
+                            <button type="button" disabled={deskCancellationBusy} onClick={() => cancelDeskSelection()} className="px-5 py-4 bg-slate-200 hover:bg-slate-300 disabled:opacity-50 text-slate-700 rounded-xl font-bold">{deskCancellationBusy ? 'İptal Ediliyor…' : 'Seçimi İptal Et'}</button>
                           </div>
                         </div>
                       )}
@@ -7661,6 +7791,7 @@ function MainApp() {
                       { id: 'violations', icon: <ShieldAlert className="w-5 h-5"/>, label: 'İhlal Kayıtları' },
                       { id: 'feedback', icon: <FileText className="w-5 h-5"/>, label: 'Dilek / Şikayet' },
                       { id: 'qr_print', icon: <QrCode className="w-5 h-5"/>, label: 'Toplu QR' },
+                      { id: 'qr_backup', icon: <Save className="w-5 h-5"/>, label: 'QR Yedekleri' },
                       { id: 'push_status', icon: <Smartphone className="w-5 h-5"/>, label: 'Push Durumu' },
                     ].map(tab => (
                       <button
@@ -7737,7 +7868,7 @@ function MainApp() {
                                 breakEndTime: null,
                                 reportEndTime: null,
                                 sessionStartTime: null,
-                                qrCode: 'QR-' + newId + '-' + generateId(),
+                                qrCode: getStaticDeskQrCode(newId),
                             };
                             setDesks(prev => [...(Array.isArray(prev) ? prev : []), newDesk]);
                             addLog('SİSTEM_AYAR', `Sisteme yeni masa (Masa ${newId}) eklendi.`);
@@ -8488,6 +8619,27 @@ function MainApp() {
                 </div>
               )}
 
+              {adminTab === 'qr_backup' && (
+                <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 space-y-5">
+                  <div><h2 className="text-xl font-bold text-slate-800">Sabit QR Kodları ve Yedekleri</h2>
+                    <p className="text-sm text-slate-600 mt-2">Mevcut masa QR kodları açılışta, masa bırakıldığında ve onarım sırasında korunur. Yeni masaların kodları sabittir.</p></div>
+                  <div className="flex flex-wrap gap-3">
+                    <button type="button" disabled={qrBackupBusy || deskQrRepairBusy} onClick={() => exportQrBackup(false)} className="px-4 py-3 bg-blue-600 text-white rounded-xl font-bold disabled:opacity-50">QR Yedeğini İndir (JSON)</button>
+                    <button type="button" disabled={qrBackupBusy || deskQrRepairBusy} onClick={() => exportQrBackup(true)} className="px-4 py-3 bg-emerald-600 text-white rounded-xl font-bold disabled:opacity-50">Tüm QR Kodlarını İndir</button>
+                    <input ref={qrBackupInputRef} type="file" accept=".json,application/json" hidden onChange={importQrBackup}/>
+                    <button type="button" disabled={qrBackupBusy || deskQrRepairBusy} onClick={() => qrBackupInputRef.current?.click()} className="px-4 py-3 bg-slate-100 text-slate-800 rounded-xl font-bold disabled:opacity-50">QR Yedeği Seç / Yükle</button>
+                  </div>
+                  <p className="text-sm text-slate-500">JSON dosyası kodları geri yüklemek içindir. Tüm QR kodları çevrimdışı açılabilen, yazdırılabilen bir HTML dosyası olarak indirilir. Tek masanın PNG görselini Toplu QR sekmesinden indirebilirsiniz.</p>
+                  {qrBackupBusy && <p role="status" className="text-blue-700 font-bold">İşlem yapılıyor…</p>}
+                  {qrBackupPreview && <div className="border border-amber-200 bg-amber-50 rounded-xl p-4 space-y-3">
+                    <p className="font-bold text-slate-800">{qrBackupPreview.filename} · {qrBackupPreview.rows.length} masa</p>
+                    <p className="text-sm text-amber-800">Geri yükleme seçili yedekteki QR kodlarını uygular. Kod farklıysa basılı kartı da yedekteki kodla eşleştirin.</p>
+                    <div className="overflow-auto max-h-64"><table className="w-full text-left text-sm"><thead><tr><th className="p-2">Masa</th><th className="p-2">Yedekteki QR kodu</th><th className="p-2">Durum</th></tr></thead><tbody>{qrBackupPreview.rows.map(row => <tr key={row.id}><td className="p-2">{row.id}</td><td className="p-2 font-mono break-all">{row.qrCode}</td><td className="p-2">{(desks || []).find(d => Number(d.id) === row.id)?.qrCode === row.qrCode ? 'Aynı' : 'Geri yüklenecek'}</td></tr>)}</tbody></table></div>
+                    <div className="flex gap-3"><button type="button" disabled={qrBackupBusy || deskQrRepairBusy} onClick={restoreQrBackup} className="px-4 py-3 bg-amber-600 text-white rounded-xl font-bold disabled:opacity-50">Yedeği Geri Yükle</button><button type="button" disabled={qrBackupBusy} onClick={() => setQrBackupPreview(null)} className="px-4 py-3 bg-white rounded-xl font-bold">Vazgeç</button></div>
+                  </div>}
+                </div>
+              )}
+
               {adminTab === 'qr_print' && (
                 <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
                   <div className="flex flex-col lg:flex-row lg:justify-between lg:items-center mb-6 gap-4 print:hidden">
@@ -8582,7 +8734,7 @@ function MainApp() {
                                ) : (
                                  <div className="w-full p-3 bg-amber-50 border border-amber-200 rounded-lg text-center">
                                    <p className="text-xs font-bold text-amber-800">QR kod yok</p>
-                                   <p className="text-[10px] text-amber-700 mt-1">Kroki → Masa {desk.id} → QR Kodunu Yenile</p>
+                                   <p className="text-[10px] text-amber-700 mt-1">Kroki → Masa {desk.id} → Sabit QR Kodunu Kontrol Et</p>
                                  </div>
                                )}
                            </div>
