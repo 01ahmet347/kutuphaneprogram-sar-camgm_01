@@ -1,3 +1,10 @@
+// EK DÜZELTMELER: giriş/oturum logları, QR mola dönüşü, ihbar hedefi,
+// ortak hesap kısıtı + YP ihbar yetkisi görünümü, önceki kapanış kurtarma.
+// Bu dosya mevcut React dosyanızın yerine kullanılır; diğer importlar korunmuştur.
+// GEREKLİ SUNUCU KONTROLÜ: /api/student-activity audit-event izin listesi
+// OGRENCI_, ÖĞRENCİ_, İHBAR/IHBAR olaylarını kabul etmelidir.
+// Tüm tarayıcılar kapalıyken 22:00 temizliği için sunucu zamanlayıcısı gerekir.
+// Sunucu/API dosyaları ekte olmadığından bu dosyada değiştirilememiştir.
 // ============================================================
 // 2026-10 KOTA / SENKRONIZASYON TOPARLAMA
 // - Firestore parçalı belge yapısı korunur.
@@ -82,6 +89,34 @@ const getLocalDayKey = (date = new Date()) => {
 
 
 
+
+// Mevcut saat ayarlarıyla aynı cihaz saatini kullanır (kurum: Türkiye).
+const getLastClosingAt = (closeTime, at = Date.now()) => {
+  const match = /^(\d{2}):(\d{2})$/.exec(String(closeTime || ''));
+  if (!match || Number(match[1]) > 23 || Number(match[2]) > 59) return 0;
+  const closing = new Date(at);
+  closing.setHours(Number(match[1]), Number(match[2]), 0, 0);
+  if (closing.getTime() > at) closing.setDate(closing.getDate() - 1);
+  return closing.getTime();
+};
+const hasSessionBeforeClosing = (desk, cutoff) => {
+  if (!desk || !cutoff) return false;
+  const timestamps = [];
+  if (desk.occupant) timestamps.push(Number(desk.sessionStartTime || 0));
+  if (desk.guestOccupant) timestamps.push(Number(desk.guestSessionStartTime || 0));
+  if (desk.pendingOccupant) timestamps.push(Number(desk.pendingDeskDeadline || 0) - 5 * 60 * 1000);
+  // Tarihi eksik eski kayıtlar açılışta temizlenir; yeni geçerli oturum varsa korunur.
+  return timestamps.length > 0 && timestamps.every(t => !Number.isFinite(t) || t <= 0 || t <= cutoff);
+};
+const clearClosedDesk = desk => ({
+  ...desk, status: desk.status === 'disabled' ? 'disabled' : 'available',
+  occupant: null, ownerDeviceId: null, guestOccupant: null, guestSessionStartTime: null,
+  guestBreakEndTime: null, guestReported: false, guestReportEndTime: null,
+  guestReportIssuedAt: null, guestReportVerifiedAt: null,
+  pendingOccupant: null, pendingDeskRole: null, pendingDeskDeadline: null,
+  breakEndTime: null, reportEndTime: null, reportIssuedAt: null,
+  reportVerifiedAt: null, sessionStartTime: null
+});
 
 const getMonthKey = (date = new Date()) => {
   const y = date.getFullYear();
@@ -310,7 +345,7 @@ const validRegistrationUrl = value => {
   } catch { return false; }
 };
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
-const isRestricted = (user, at = Date.now()) => user?.pendingApproval === true || Number(user?.restrictedUntil || 0) > at;
+const isRestricted = (user, at = Date.now()) => user?.blocked === true || user?.pendingApproval === true || Number(user?.restrictedUntil || 0) > at;
 const lostDeskToday = (user, deskId) => user?.lostDeskDate === getLocalDayKey() && (user?.lostDeskIds || []).includes(Number(deskId));
 const applyViolationPolicy = (user, deskId, at = Date.now()) => {
   const history = [...(Array.isArray(user.violationHistory) ? user.violationHistory : []), at];
@@ -2883,7 +2918,7 @@ function MainApp() {
     try { localStorage.setItem('sgm_append_outbox', JSON.stringify(readAppendOutbox())); } catch (error) { console.warn('Bekleyen kayıtlar saklanamadı:', error); }
   };
   const isStudentAuditType = type => [
-    'SISTEM_GIRIS', 'PIL_AYARI_BILGILENDIRME', 'OGRENCI_CIKIS', 'GERIBILDIRIM_ACILDI',
+    'SISTEM_GIRIS', 'PIL_AYARI_BILGILENDIRME', 'OGRENCI_', 'ÖĞRENCİ_', 'İHBAR', 'IHBAR', 'GERIBILDIRIM_ACILDI',
     'MASA_', 'MOLA_', 'BILDIRIM_IPTAL', 'KISITLI_ISLEM_ENGELLENDI',
     'MASA_BEKLEME_ENGELLENDI', 'AYNI_', 'UYGULAMA_'
   ].some(prefix => String(type || '').startsWith(prefix)) && !String(type || '').includes('ADMIN');
@@ -3067,6 +3102,96 @@ function MainApp() {
     return newLog;
   };
 
+  const appOpenLoggedRef = useRef(false);
+  const restoredLoginLoggedRef = useRef(false);
+  useEffect(() => {
+    if (!isDataLoaded || !granularLoadedRef.current.settings && db) return;
+    if (!appOpenLoggedRef.current) {
+      appOpenLoggedRef.current = true;
+      addLog('SISTEM_GIRIS', 'Uygulama açıldı; sistem verileri yüklendi.', null, currentUser?.id || null);
+    }
+    if (currentUser && !restoredLoginLoggedRef.current) {
+      restoredLoginLoggedRef.current = true;
+      const desk = desksRef.current.find(d => d.occupant === currentUser.id || d.guestOccupant === currentUser.id);
+      addLog('OGRENCI_OTURUM_ACILDI', 'Öğrenci oturumu açıldı / yeniden yüklendi.', desk?.id || null, currentUser.id, false, null, {
+        deskStatus: desk?.status || 'masasiz',
+        onBreak: desk?.occupant === currentUser.id ? desk.status === 'on_break' : Number(desk?.guestBreakEndTime || 0) > Date.now()
+      });
+    }
+    if (!currentUser) restoredLoginLoggedRef.current = false;
+  }, [isDataLoaded, currentUser?.id, fbUser, settings, desks]);
+
+  // Son kapanıştan önce başlamış oturumları açılışta yakala. İşlem sunucudaki
+  // güncel masa ve kullanıcıları tekrar okuyarak yeni günün masalarını korur.
+  // Sunucu cron'u yerine geçmez: çevrimiçi temizlik için yönetici oturumu gerekir.
+  const closingRecoveryBusyRef = useRef(false);
+  const recoverPreviousClosing = async () => {
+    if (!isDataLoaded || (db && (!adminAuthorized || !fbUser || !navigator.onLine)) || closingRecoveryBusyRef.current) return;
+    if (db && (!granularLoadedRef.current.desks || !granularLoadedRef.current.users || !granularLoadedRef.current.settings)) return;
+    const cutoff = getLastClosingAt(settingsRef.current.closeTime);
+    if (!cutoff) return;
+    const candidates = desksRef.current.filter(d => hasSessionBeforeClosing(d, cutoff));
+    if (!candidates.length) return;
+    closingRecoveryBusyRef.current = true;
+    try {
+      for (const candidate of candidates) {
+        const clean = async (tx) => {
+          const deskRef = db ? getLiveDoc('sgmDesks', candidate.id) : null;
+          const snap = tx ? await tx.get(deskRef) : null;
+          const desk = tx ? (snap.exists() ? { ...snap.data(), id: candidate.id } : null) : desksRef.current.find(d => d.id === candidate.id);
+          if (!desk || !hasSessionBeforeClosing(desk, cutoff)) return null;
+          const ids = [...new Set([desk.occupant, desk.guestOccupant, desk.pendingOccupant].filter(Boolean))];
+          const related = [];
+          for (const id of ids) {
+            const userRef = db ? getLiveDoc('sgmUsers', id) : null;
+            const userSnap = tx ? await tx.get(userRef) : null;
+            const user = tx ? (userSnap.exists() ? { ...userSnap.data(), id } : null) : usersRef.current.find(u => u.id === id);
+            if (user) related.push({ userRef, user });
+          }
+          const clearedDesk = clearClosedDesk(desk);
+          const clearedUsers = related.map(({user}) => ({ ...user,
+            ...(Number(user.activeDeskId) === Number(desk.id) ? {activeDeskId: null, activeDeskRole: null} : {}),
+            ...(Number(user.pendingDeskId) === Number(desk.id) ? {pendingDeskId: null, pendingDeskDeadline: null} : {})
+          }));
+          const event = {
+            id: `close-recovery-${cutoff}-${desk.id}`, time: Date.now(), type: 'KAPANIS_MASA_OTOMATIK_BOSALTILDI',
+            message: `Önceki kapanıştan kalan Masa ${desk.id} oturumu boşaltıldı.`, deskId: desk.id,
+            userId: desk.occupant || desk.pendingOccupant || desk.guestOccupant || null,
+            actorId: 'ADMIN', actorFirebaseUid: auth?.currentUser?.uid || null, actorInfo: 'Yönetici',
+            previousStatus: desk.status, closingAt: cutoff, previousSessionStartTime: desk.sessionStartTime || null
+          };
+          if (tx) {
+            tx.set(deskRef, clearedDesk);
+            related.forEach(({userRef}, i) => tx.set(userRef, clearedUsers[i], { merge: true }));
+            tx.set(getLiveDoc('sgmAudit', event.id), event);
+          }
+          return {desk: clearedDesk, users: clearedUsers, event};
+        };
+        const result = db ? await runTransaction(db, clean) : await clean(null);
+        if (!result) continue;
+        applyCloudRows({desk: result.desk});
+        result.users.forEach(user => applyCloudRows({user}));
+        // Sunucu işlemi logu da atomik yazdı; arşive ikinci kez gönderme.
+        const nextLogs = [result.event, ...logsRef.current.filter(l => l.id !== result.event.id)].slice(0, 500);
+        logsRef.current = nextLogs; setLogs(nextLogs);
+        localStorage.setItem('sgm_desks', JSON.stringify(desksRef.current));
+        localStorage.setItem('sgm_users', JSON.stringify(usersRef.current));
+        localStorage.setItem('sgm_logs', JSON.stringify(nextLogs));
+        if (!db) archiveLog(result.event);
+      }
+    } catch (error) { handleFirestoreQuotaError(error); }
+    finally { closingRecoveryBusyRef.current = false; }
+  };
+  useEffect(() => {
+    const recover = () => { recoverPreviousClosing(); };
+    recover();
+    const timer = setInterval(recover, 15000);
+    const resume = () => { if (!document.hidden) recover(); };
+    window.addEventListener('online', recover);
+    document.addEventListener('visibilitychange', resume);
+    return () => { clearInterval(timer); window.removeEventListener('online', recover); document.removeEventListener('visibilitychange', resume); };
+  }, [isDataLoaded, adminAuthorized, fbUser, settings.closeTime, desks]);
+
   const runFullDayCleanup = ({ source = 'manual', cleanupTime = Date.now(), dayKey = getLocalDayKey(), dayLabel = new Date().toDateString(), writeAutoCloseMarker = false } = {}) => {
     const beforeDesks = Array.isArray(desksRef.current) ? desksRef.current : [];
     const beforeUsers = Array.isArray(usersRef.current) ? usersRef.current : [];
@@ -3147,6 +3272,7 @@ function MainApp() {
       ...d,
       status: d.status === 'disabled' ? 'disabled' : 'available',
       occupant: null,
+      ownerDeviceId: null,
       guestOccupant: null,
       guestSessionStartTime: null,
       guestBreakEndTime: null,
@@ -3314,7 +3440,7 @@ function MainApp() {
          addLog('SİSTEM_OTOMATİK', 'Yeni gün başlangıcı: Tüm mola ve ihlal hakları sıfırlandı.');
       }
 
-      if (settings.closeTime && currentTimeMin >= closeTimeMin && localStorage.getItem('sgm_last_close') !== todayStr) {
+      if ((!db || adminAuthorized) && settings.closeTime && !checkLibraryOpen() && currentTimeMin >= closeTimeMin && localStorage.getItem('sgm_last_close') !== todayStr) {
          // 22:00 kapanışında sadece bildirim/log değil, masa + kullanıcı + localStorage + Firestore
          // aynı işlem içinde temizlenir. İşaret, temizlik başlatıldıktan sonra yazılır.
          runFullDayCleanup({
@@ -3359,7 +3485,7 @@ function MainApp() {
       const safetyMarkerKey = `sgm_last_dynamic_safety_check_v3_${safetyTimeKey}`;
 
       if (
-        safetyWindowReached &&
+        (!db || adminAuthorized) && safetyWindowReached &&
         localStorage.getItem(safetyMarkerKey) !== todayStr
       ) {
          const desksAtSafety = Array.isArray(desksRef.current) ? desksRef.current : [];
@@ -3498,7 +3624,7 @@ function MainApp() {
       // Döngü içi state çakışmasını engellemek için mevcut değerleri Ref'ten okuyoruz
       const restrictedIds = new Set((usersRef.current || []).filter(u => u.blocked || isRestricted(u, currentTime)).map(u => u.id));
       const restrictedDeskIds = new Set((desksRef.current || []).filter(d => restrictedIds.has(d.occupant) || restrictedIds.has(d.pendingOccupant)).map(d => d.id));
-      if (restrictedDeskIds.size) {
+      if ((!db || adminAuthorized) && restrictedDeskIds.size) {
         (desksRef.current || []).filter(desk => restrictedDeskIds.has(desk.id)).forEach(desk => {
           const userId = desk.occupant || desk.pendingOccupant;
           addLog('HESAP_KISITI_MASA_BOSALTILDI', `Masa ${desk.id}, kullanıcı hesabının kısıtlanması nedeniyle boşaltıldı.`, desk.id, userId, false, null,
@@ -3725,7 +3851,7 @@ function MainApp() {
       }
     }, 1000);
     return () => clearInterval(timer);
-  }, [settings.strikeLimit, settings.openTime, settings.closeTime, settings.shortBreakCount, settings.longBreakCount, currentUser, isDataLoaded]);
+  }, [settings.strikeLimit, settings.openTime, settings.closeTime, settings.shortBreakCount, settings.longBreakCount, currentUser, isDataLoaded, adminAuthorized]);
 
   // AYNI CİHAZ = TEK MASA KURALI
   // Aynı tarayıcı/cihaz kimliği üzerinden başka bir kullanıcı adına aktif masa
@@ -4143,6 +4269,7 @@ function MainApp() {
       localStorage.setItem('sgm_users', JSON.stringify(safeUsers));
       granularBaselineRef.current.users.set(String(user.id), user);
 
+    setFbUser(credential.user);
     // Kısıtlı kullanıcı da giriş yapar; işlem yetkileri güncel hesap kaydıyla kontrol edilir.
     const pendingIsValid = user.pendingDeskId && user.pendingDeskDeadline && Number(user.pendingDeskDeadline) > Date.now();
     const updatedUser = {
@@ -4187,6 +4314,8 @@ function MainApp() {
     setUsers([]);
     usersRef.current = [];
     localStorage.removeItem('sgm_users');
+    // Çıkış kaydı mevcut öğrenci tokenı geçerliyken gönderilsin.
+    await appendChainRef.current.catch(() => {});
     if (auth) {
       await signOut(auth);
       await signInAnonymously(auth);
@@ -4787,7 +4916,7 @@ function MainApp() {
       }
       if (db) {
         try {
-          const result = await runStudentDeskAction('break-end', { deskId: currentUser.activeDeskId, qrCode });
+          const result = await runStudentDeskAction('break-end', { deskId: currentUser.activeDeskId, qrCode: qrData });
           applyCloudRows(result);
         } catch (error) {
           handleFirestoreQuotaError(error);
@@ -4814,7 +4943,7 @@ function MainApp() {
 
     if (db) {
       try {
-        const result = await runStudentDeskAction('break-end', { deskId: currentUser.activeDeskId, qrCode });
+        const result = await runStudentDeskAction('break-end', { deskId: currentUser.activeDeskId, qrCode: qrData });
         applyCloudRows(result);
       } catch (error) {
         handleFirestoreQuotaError(error);
@@ -4840,10 +4969,11 @@ function MainApp() {
   };
 
   const promptReportDesk = (deskId) => {
-    if (!requireStudentAction('Boş masa ihbarı')) return;
-    const safeUsers = Array.isArray(users) ? users : [];
-    const myUser = safeUsers.find(u => u.id === currentUser.id);
-    if(!myUser || myUser.canReport === false || !settings.reportsEnabled) return showMessage("Yetki Yok", "İhbar etme yetkiniz yönetici tarafından askıya alınmıştır.", "danger");
+    const myUser = requireStudentAction('Boş masa ihbarı');
+    if (!myUser) return;
+    if (settings.reportsEnabled === false) return showMessage('İhbar Kapalı', 'Boş masa ihbarları sistem genelinde kapalıdır.', 'warning');
+    if (myUser.canReport === false) return showMessage('İhbar Yetkisi Kapalı', 'Hesabınızın ihbar yetkisi kapalıdır. Kütüphane sorumlusu kullanıcı düzenleme ekranından bu yetkiyi açabilir.', 'warning');
+    const safeUsers = Array.isArray(usersRef.current) ? usersRef.current : [];
 
     const safeDesks = Array.isArray(desks) ? desks : [];
     const desk = safeDesks.find(d => d.id === deskId);
@@ -4851,8 +4981,10 @@ function MainApp() {
     if(desk.status === 'disabled' || !desk.occupant) return showMessage("Uyarı", "Bu masada ihbar edilebilecek aktif kullanıcı bulunmuyor.", "warning");
     if(deskId === currentUser.activeDeskId) return showMessage("Uyarı", "Kendi bulunduğunuz masadaki kişileri ihbar edemezsiniz.", "warning");
 
-    const owner = safeUsers.find(u => u.id === desk.occupant);
-    const guest = desk.guestOccupant ? safeUsers.find(u => u.id === desk.guestOccupant) : null;
+    // Öğrenci yalnızca kendi hesap belgesini okur. Hedef kimliği masa kaydından gelir;
+    // diğer öğrencilerin özel hesap bilgilerini indirmek gerekmez.
+    const owner = safeUsers.find(u => u.id === desk.occupant) || { id: desk.occupant, name: 'Masa kullanıcısı' };
+    const guest = desk.guestOccupant ? (safeUsers.find(u => u.id === desk.guestOccupant) || { id: desk.guestOccupant, name: 'Misafir kullanıcı' }) : null;
 
     const openFormFor = (targetRole) => {
       const target = targetRole === 'guest' ? guest : owner;
@@ -4889,7 +5021,7 @@ function MainApp() {
   const handleReportSubmit = async (deskId, name, identityNo, targetRole = 'owner', targetUserId = null) => {
     const freshReporter = requireStudentAction('Boş masa ihbarı gönderme');
     if (!freshReporter) return;
-    if (freshReporter.canReport === false || !settings.reportsEnabled) return showMessage('İhbar Kapalı', 'İhbar etme yetkisi kapalıdır.', 'warning');
+    if (freshReporter.canReport === false || settings.reportsEnabled === false) return showMessage('İhbar Kapalı', 'İhbar etme yetkisi kapalıdır.', 'warning');
     // İHBAR EDEN KİŞİ KAYIT KONTROLÜ:
     // İhbar gönderebilmek için girilen ad-soyad ve kimlik numarası AYNI kayıtlı kullanıcıyla eşleşmelidir.
     // Böylece rastgele / uydurma bilgilerle ihbar oluşturulamaz.
@@ -5523,7 +5655,7 @@ function MainApp() {
         break;
       case 'toggle_report_auth':
         if (userId) {
-          setUsers(prev => Array.isArray(prev) ? prev.map(u => u.id === userId ? { ...u, canReport: !u.canReport } : u) : []);
+          setUsers(prev => Array.isArray(prev) ? prev.map(u => u.id === userId ? { ...u, canReport: u.canReport === false } : u) : []);
           addLog('ADMIN_YETKI', `Kullanıcının ihbar yetkisi değiştirildi.`, null, userId);
         }
         break;
@@ -7369,7 +7501,7 @@ function MainApp() {
                     <div className="mb-4 space-y-2"><label htmlFor="user-search" className="block font-bold text-slate-700">Kullanıcı Ara</label><input id="user-search" type="search" value={userSearch} onChange={e => setUserSearch(e.target.value)} placeholder="GM Özel Kod, şifre veya ad soyad yazın" className="w-full p-3 border rounded-xl"/><p className="text-xs text-slate-500">Bulunan: {filteredUsers.length} {userSearch && <button onClick={() => setUserSearch('')} className="ml-3 text-blue-700 font-bold">Aramayı temizle</button>}</p></div>
                     <table className="w-full text-left border-collapse text-sm min-w-[1100px]">
                       <thead><tr className="bg-slate-50 text-slate-500 border-b"><th className="p-3"><input type="checkbox" checked={filteredUsers.length > 0 && filteredUsers.every(u => selectedUserIds.includes(u.id))} onChange={e=>setSelectedUserIds(prev=>e.target.checked ? [...new Set([...prev, ...filteredUsers.map(u=>u.id)])] : prev.filter(id=>!filteredUsers.some(u=>u.id===id)))}/></th><th className="p-3">8 Haneli Şifre</th><th className="p-3">GM Özel Kod</th><th className="p-3">Hesap Durumu</th><th className="p-3">Aktif Masa</th><th className="p-3 text-center">İhlal</th><th className="p-3 text-center">İşlemler</th></tr></thead>
-                      <tbody>{filteredUsers.map(u=><tr key={u.id} className="border-b border-slate-100 hover:bg-slate-50"><td className="p-3"><input type="checkbox" checked={selectedUserIds.includes(u.id)} onChange={e=>setSelectedUserIds(prev=>e.target.checked?[...new Set([...prev,u.id])]:prev.filter(id=>id!==u.id))}/></td><td className="p-3 font-mono font-bold tracking-widest">{u.pin}</td><td className="p-3 font-mono font-black text-indigo-700 tracking-widest"><button onClick={() => openAdminUserEditor(u.id)} className="hover:underline">{u.specialCode || '-'}</button></td><td className="p-3">{u.pendingApproval ? "Onay Bekliyor" : isRestricted(u) ? "Kısıtlı" : "Aktif"}</td><td className="p-3">{u.activeDeskId?`Masa ${u.activeDeskId}`:'Yok'}</td><td className="p-3 text-center text-red-600 font-bold">{u.strikes}</td><td className="p-3 text-center"><div className="flex flex-wrap justify-center gap-2"><button onClick={()=>openAdminUserEditor(u.id)} className="px-3 py-1 bg-blue-50 text-blue-700 rounded font-bold">Düzenle</button><button onClick={()=>handleAdminAction('toggle_block',null,u.id)} className="px-3 py-1 bg-slate-100 rounded font-bold">{isRestricted(u)?'Kısıtlı':'Kısıt Ver'}</button><button onClick={()=>handleAdminAction('delete_user',null,u.id)} className="px-3 py-1 bg-red-50 text-red-600 rounded font-bold">Sil</button></div></td></tr>)}</tbody>
+                      <tbody>{filteredUsers.map(u=><tr key={u.id} className="border-b border-slate-100 hover:bg-slate-50"><td className="p-3"><input type="checkbox" checked={selectedUserIds.includes(u.id)} onChange={e=>setSelectedUserIds(prev=>e.target.checked?[...new Set([...prev,u.id])]:prev.filter(id=>id!==u.id))}/></td><td className="p-3 font-mono font-bold tracking-widest">{u.pin}</td><td className="p-3 font-mono font-black text-indigo-700 tracking-widest"><button onClick={() => openAdminUserEditor(u.id)} className="hover:underline">{u.specialCode || '-'}</button></td><td className="p-3">{u.blocked ? "Kısıtlı (Engelli)" : u.pendingApproval ? "Onay Bekliyor" : isRestricted(u, now) ? "Kısıtlı" : "Aktif"}<div className="text-xs text-slate-500 mt-1">İhbar: {isRestricted(u, now) ? "Hesap kısıtlı" : settings.reportsEnabled === false ? "Sistem genelinde kapalı" : u.canReport === false ? "Yetki kapalı" : "Açık"}</div></td><td className="p-3">{u.activeDeskId?`Masa ${u.activeDeskId}`:'Yok'}</td><td className="p-3 text-center text-red-600 font-bold">{u.strikes}</td><td className="p-3 text-center"><div className="flex flex-wrap justify-center gap-2"><button onClick={()=>openAdminUserEditor(u.id)} className="px-3 py-1 bg-blue-50 text-blue-700 rounded font-bold">Düzenle</button><button onClick={()=>handleAdminAction('toggle_block',null,u.id)} className="px-3 py-1 bg-slate-100 rounded font-bold">{isRestricted(u)?'Kısıtlı':'Kısıt Ver'}</button><button onClick={()=>handleAdminAction('delete_user',null,u.id)} className="px-3 py-1 bg-red-50 text-red-600 rounded font-bold">Sil</button></div></td></tr>)}</tbody>
                     </table>
                   </div>
                 </div>
