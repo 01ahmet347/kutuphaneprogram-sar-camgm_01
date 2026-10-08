@@ -111,7 +111,7 @@ const handler = createStudentDeskHandler({
             tx.get(deskRef)
           ]);
 
-          if (!userSnapshot.exists() || !deskSnapshot.exists()) {
+          if (!userSnapshot.exists || !deskSnapshot.exists) {
             throw new Error('Rezervasyon bulunamadı.');
           }
 
