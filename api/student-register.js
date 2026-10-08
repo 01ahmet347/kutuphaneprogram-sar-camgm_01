@@ -98,7 +98,7 @@ const handler = createStudentRegistrationHandler({
         windowStart: attempts === 1 ? at : windowStart,
         updatedAt: at
       });
-      return attempts > 3;
+      return attempts > 10;
     });
   }),
 
