@@ -1,3 +1,5 @@
+// EK DÜZELTME: Ayar kaydı ihbarı kapatmaz; yönetici listesi oturum kapsamında dinlenir.
+// Sunucu ayarları tüm açık ekranlara anında uygulanır; mola ihbarı engellenir.
 // EK DÜZELTME: Güncel anonim kayıt tokenı, ayrı öğrenci oturumu ve sunucuda atomik yönetici hesabı oluşturma.
 // EK DÜZELTME: Yönetici kaydı güncel Firebase tokenıyla doğrulanır; eski oturum sonuçları yok sayılır.
 // EK DÜZELTME: Hesap onayı/kısıt değişikliği sunucu transaction'ı tamamlanmadan başarılı sayılmaz.
@@ -104,6 +106,18 @@ const getLocalDayKey = (date = new Date()) => {
 
 
 // Mevcut saat ayarlarıyla aynı cihaz saatini kullanır (kurum: Türkiye).
+const updatedBreakAllowance = (user, before, after) => {
+  const next = {...(user.breaks || {})};
+  for (const type of ['short', 'long']) {
+    const key = type === 'short' ? 'shortBreakCount' : 'longBreakCount';
+    const oldLimit = Math.max(0, Number(before[key]) || 0);
+    const newLimit = Math.max(0, Number(after[key]) || 0);
+    const remaining = Number.isFinite(Number(user.breaks?.[type])) ? Number(user.breaks[type]) : oldLimit;
+    next[type] = Math.max(0, Math.min(newLimit, remaining + newLimit - oldLimit));
+  }
+  return next;
+};
+
 const getLastClosingAt = (closeTime, at = Date.now()) => {
   const match = /^(\d{2}):(\d{2})$/.exec(String(closeTime || ''));
   if (!match || Number(match[1]) > 23 || Number(match[2]) > 59) return 0;
@@ -359,10 +373,7 @@ const validRegistrationUrl = value => {
 };
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 const isRestricted = (user, at = Date.now()) => user?.blocked === true || user?.pendingApproval === true || Number(user?.restrictedUntil || 0) > at;
-const shouldRestoreReportPermission = (user, at = Date.now()) => Boolean(user) && !isRestricted(user, at) && user.canReport === false && (
-  Number(user.reportPermissionPolicyVersion || 0) < 1 ||
-  Number(user.restrictedUntil || 0) > Number(user.reportPermissionRestrictionUntil || 0)
-);
+const shouldRestoreReportPermission = (user, at = Date.now()) => Boolean(user) && !isRestricted(user, at) && user.canReport === false;
 const lostDeskToday = (user, deskId) => user?.lostDeskDate === getLocalDayKey() && (user?.lostDeskIds || []).includes(Number(deskId));
 const applyViolationPolicy = (user, deskId, at = Date.now()) => {
   const history = [...(Array.isArray(user.violationHistory) ? user.violationHistory : []), at];
@@ -850,6 +861,7 @@ function MainApp() {
   const deskActionInFlightRef = useRef(false);
   const [syncRetryEpoch, setSyncRetryEpoch] = useState(0);
   const [adminAuthorized, setAdminAuthorized] = useState(false);
+  const verifiedAdminUidRef = useRef(null);
   const [studentMessages, setStudentMessages] = useState([]);
   const [feedbackSending, setFeedbackSending] = useState(false);
   const feedbackInFlightRef = useRef(false);
@@ -1609,10 +1621,11 @@ function MainApp() {
   }, [desks, users, view]);
 
   useEffect(() => {
-    if (settings.reportsEnabled === false) {
-       setSettings(prev => ({ ...prev, reportsEnabled: true }));
+    if (!db && settings.reportsEnabled === false) {
+       const next = {...settingsRef.current, reportsEnabled: true};
+       settingsRef.current = next; setSettings(next);
     }
-  }, []);
+  }, [settings.reportsEnabled]);
 
   // Aylık günlük kod takvimi:
   // - İçinde bulunulan ayın tüm günleri için 6 haneli kodlar hazırlanır.
@@ -1762,6 +1775,7 @@ function MainApp() {
       const epoch = ++authStateEpoch;
       setFbUser(user);
       if (!user) {
+        verifiedAdminUidRef.current = null;
         setAdminAuthorized(false);
         usersRef.current = [];
         setUsers([]);
@@ -1770,6 +1784,7 @@ function MainApp() {
         // Önceki anonim/öğrenci oturumunun gecikmiş sonucu yeni yönetici oturumunu ezmesin.
         if (disposed || epoch !== authStateEpoch || auth.currentUser?.uid !== user.uid) return;
         const isAdmin = result.claims.admin === true;
+        verifiedAdminUidRef.current = isAdmin ? user.uid : null;
         setAdminAuthorized(isAdmin);
         if (!isAdmin) {
           const ownUser = usersRef.current.find(row => String(row.id) === user.uid);
@@ -1779,6 +1794,7 @@ function MainApp() {
         }
       }).catch(() => {
         if (disposed || epoch !== authStateEpoch || auth.currentUser?.uid !== user.uid) return;
+        verifiedAdminUidRef.current = null;
         setAdminAuthorized(false);
         usersRef.current = [];
         setUsers([]);
@@ -2107,7 +2123,7 @@ function MainApp() {
 
   const buildLegacyNormalizedData = data => {
     const incomingSettings = mergeRegistrationSettings(settingsRef.current, { ...DEFAULT_SETTINGS, ...(data?.settings || {}) });
-    const normalizedSettings = { ...incomingSettings, showBlueRoomKroki: false, useCustomLayout: true, layoutSchemaVersion: 3 };
+    const normalizedSettings = { ...incomingSettings, showBlueRoomKroki: false, layoutSchemaVersion: 3 };
     const remoteLayoutIsOld = Number(data?.settings?.layoutSchemaVersion || 0) < 3;
     const oldLogs = Array.isArray(data?.logs) ? data.logs : [];
     return {
@@ -2170,6 +2186,7 @@ function MainApp() {
           throw new Error('Mevcut Firebase oturumunda yönetici yetkisi yok. Yönetici kullanıcı adı ve şifresiyle yeniden giriş yapın.');
         }
         // React state'i geride kalsa bile gerçek ve doğrulanmış oturum kullanılır.
+        verifiedAdminUidRef.current = liveUser.uid;
         setFbUser(liveUser); setAdminAuthorized(true);
       }
       // Önceden sıraya alınmış yazmalar bu açık yönetici işlemini geri alamaz.
@@ -2231,7 +2248,8 @@ function MainApp() {
     };
   }, [currentUser?.id, fbUser]);
 
-  const adminDataMode = view === 'admin_dash' && adminAuthorized;
+  // Veri kapsamı sayfaya değil doğrulanmış yönetici oturumuna bağlıdır.
+  const adminDataMode = adminAuthorized;
 
   useEffect(() => {
     if (!fbUser || !db) return;
@@ -2248,7 +2266,9 @@ function MainApp() {
     setUsersSyncError('');
     const userSource = adminDataMode ? getLiveCollection('sgmUsers') : getLiveDoc('sgmUsers', fbUser.uid);
     unsubs.push(onSnapshot(userSource, { includeMetadataChanges: true }, snapshot => {
-      if (cancelled || snapshot.metadata.fromCache) return;
+      if (cancelled || snapshot.metadata.fromCache || auth?.currentUser?.uid !== fbUser.uid) return;
+      // Eski tek hesap dinleyicisi, yeni yönetici listesini tek kullanıcıya düşüremez.
+      if (!adminDataMode && verifiedAdminUidRef.current === fbUser.uid) return;
       setUsersSyncError('');
       if (adminDataMode) {
         const remoteRows = snapshot.docs.map(d => ({ ...d.data(), id: d.id }));
@@ -2355,17 +2375,13 @@ function MainApp() {
         // CONFIG: SETTINGS
         unsubs.push(onSnapshot(getLiveSettingsDoc(), snap => {
           if (snap.exists()) {
-            const remote = mergeRegistrationSettings(settingsRef.current, { ...DEFAULT_SETTINGS, ...snap.data(), showBlueRoomKroki: false, useCustomLayout: true, layoutSchemaVersion: 3 });
+            const remote = mergeRegistrationSettings(settingsRef.current, { ...DEFAULT_SETTINGS, ...snap.data(), showBlueRoomKroki: false, layoutSchemaVersion: 3 });
             const remoteJson = stableJson(remote);
-            const localChanged = granularSeenRemoteRef.current.settings &&
-              granularBaselineRef.current.settings !== stableJson(settingsRef.current);
             granularBaselineRef.current.settings = remoteJson;
             granularSeenRemoteRef.current.settings = true;
-            // Öğrenci cihazında yerel ayar farkları sunucudaki yeni saatleri engellemesin.
-            if (!adminDataMode || !localChanged) {
-              settingsRef.current = remote;
-              setSettings(remote);
-            }
+            // Tüm cihazlar ve yönetici ekranı sunucunun son ayarını hemen uygular.
+            settingsRef.current = remote;
+            setSettings(remote);
           }
           markGranularLoaded('settings');
         }, error => { retry(error); setIsDataLoaded(true); }));
@@ -4275,6 +4291,7 @@ function MainApp() {
         if (!registrationAuthUser) registrationAuthUser = (await signInAnonymously(auth)).user;
         // İstek kaybolursa tekrar aynı yeni oturum kullanılır; ikinci hesap açılmaz.
         sessionStorage.removeItem('sgm_registration_new_person');
+        verifiedAdminUidRef.current = null;
         setFbUser(registrationAuthUser);
       }
       // Aynı doğrulanmış anonim oturumda eksik yerel hesap, kayıt API'sinden
@@ -5178,8 +5195,9 @@ function MainApp() {
     const safeUsers = Array.isArray(usersRef.current) ? usersRef.current : [];
 
     const safeDesks = Array.isArray(desks) ? desks : [];
-    const desk = safeDesks.find(d => d.id === deskId);
+    const desk = safeDesks.find(d => Number(d.id) === Number(deskId));
     if(!desk) return showMessage("Uyarı", "Masa bulunamadı.", "warning");
+    if (desk.status === 'on_break') return showMessage('Masa Molada', 'Resmî moladaki masa ihbar edilemez.', 'info');
     if(desk.status === 'disabled' || !desk.occupant) return showMessage("Uyarı", "Bu masada ihbar edilebilecek aktif kullanıcı bulunmuyor.", "warning");
     if(deskId === currentUser.activeDeskId) return showMessage("Uyarı", "Kendi bulunduğunuz masadaki kişileri ihbar edemezsiniz.", "warning");
 
@@ -5857,6 +5875,8 @@ function MainApp() {
         break;
       case 'toggle_report_auth':
         if (userId) {
+          const target = usersRef.current.find(u => u.id === userId);
+          if (target && !isRestricted(target)) return showMessage('İhbar Yetkisi Açık', 'Kısıtsız hesaplarda boş masa ihbarı açıktır. Moladaki masa ihbar edilemez.', 'info');
           setUsers(prev => Array.isArray(prev) ? prev.map(u => u.id === userId ? { ...u, canReport: u.canReport === false, reportPermissionPolicyVersion: 1, reportPermissionRestrictionUntil: Number(u.restrictedUntil || 0) } : u) : []);
           addLog('ADMIN_YETKI', `Kullanıcının ihbar yetkisi değiştirildi.`, null, userId);
         }
@@ -6034,7 +6054,7 @@ function MainApp() {
               canReport: newCanReport
             };
             // Onay/engel/süreli kısıt kalktığı anda ihbar yetkisini de aç.
-            if (isRestricted(user) && !isRestricted(updatedUser)) updatedUser.canReport = true;
+            if (!isRestricted(updatedUser)) updatedUser.canReport = true;
             if (!isRestricted(updatedUser)) {
               updatedUser.reportPermissionPolicyVersion = 1;
               updatedUser.reportPermissionRestrictionUntil = Number(updatedUser.restrictedUntil || 0);
@@ -6470,6 +6490,27 @@ function MainApp() {
     setSelectedUserIds([]);
     addLog('ADMIN_TOPLU_KULLANICI', `${ids.size} kullanıcı için ${action} toplu işlemi uygulandı.`);
   };
+
+  const reportSettingsRepairBusyRef = useRef(false);
+  useEffect(() => {
+    if (!db || !adminDataMode || !fbUser || !isDataLoaded || settings.reportsEnabled !== false || reportSettingsRepairBusyRef.current) return;
+    reportSettingsRepairBusyRef.current = true;
+    const enable = async () => {
+      try {
+        const next = await runTransaction(db, async tx => {
+          const ref = getLiveSettingsDoc(), snapshot = await tx.get(ref);
+          const remote = {...DEFAULT_SETTINGS, ...(snapshot.data() || {})};
+          if (remote.reportsEnabled === false) tx.set(ref, {reportsEnabled: true}, {merge: true});
+          return {...remote, reportsEnabled: true};
+        });
+        granularBaselineRef.current.settings = stableJson(next);
+        settingsRef.current = next; setSettings(next);
+        addLog('ADMIN_IHBAR_SISTEM_ACILDI', 'Boş masa ihbarı sistem genelinde açıldı. Moladaki masalar ihbar edilemez.');
+      } catch (error) { handleFirestoreQuotaError(error); }
+      finally { reportSettingsRepairBusyRef.current = false; }
+    };
+    enable();
+  }, [adminDataMode, fbUser, isDataLoaded, settings.reportsEnabled, Math.floor(now / 15000)]);
 
   const reportPermissionRepairBusyRef = useRef(false);
   useEffect(() => {
@@ -7541,6 +7582,7 @@ function MainApp() {
                   const credential = await signInWithCustomToken(auth, payload.token);
                   const claims = await credential.user.getIdTokenResult(true);
                   if (auth.currentUser?.uid !== credential.user.uid || claims.claims.admin !== true) throw new Error('Yönetici yetkisi doğrulanamadı.');
+                  verifiedAdminUidRef.current = credential.user.uid;
                   setFbUser(credential.user);
                   setAdminAuthorized(true);
                   addLog('ADMIN_GIRIS', 'Yönetici paneline giriş yapıldı.');
@@ -7839,14 +7881,24 @@ function MainApp() {
               {adminTab === 'settings' && (
                 <div className="max-w-2xl mx-auto bg-white p-8 rounded-2xl shadow-sm border border-slate-200">
                   <h2 className="text-xl font-bold text-slate-800 mb-6 flex items-center gap-2"><Settings className="text-blue-600"/> Sistem Ayarları</h2>
-                  <form onSubmit={async (e) => {
+                  <form key={stableJson(settings)} onSubmit={async (e) => {
                      e.preventDefault();
                      if (systemSettingsSavingRef.current) return;
-                     if (!db || !fbUser || !adminAuthorized || navigator.onLine === false) {
-                       return showMessage('Ayarlar Kaydedilemedi', 'Sunucu bağlantısını kontrol edip tekrar deneyin. Saatlerin öğrencilere yansıması için sunucu kaydı gereklidir.', 'warning');
+                     const formData = new FormData(e.currentTarget);
+                     if (db) {
+                       try {
+                         await auth.authStateReady();
+                         const liveUser = auth.currentUser;
+                         if (!liveUser) throw new Error('Yönetici oturumu bulunamadı.');
+                         const token = await liveUser.getIdTokenResult(true);
+                         if (auth.currentUser?.uid !== liveUser.uid || token.claims.admin !== true) throw new Error('Yönetici yetkisi doğrulanamadı.');
+                         verifiedAdminUidRef.current = liveUser.uid;
+                         setFbUser(liveUser); setAdminAuthorized(true);
+                       } catch (error) {
+                         return showMessage('Ayarlar Kaydedilemedi', error.message, 'warning');
+                       }
                      }
                      pushUndoSnapshot('Sistem ayarlarını kaydetme');
-                     const formData = new FormData(e.target);
                      const previousOpenTime = String(settings.openTime || DEFAULT_SETTINGS.openTime);
                      const previousCloseTime = String(settings.closeTime || DEFAULT_SETTINGS.closeTime);
                      const nextOpenTime = String(formData.get('openTime') || DEFAULT_SETTINGS.openTime);
@@ -7862,7 +7914,7 @@ function MainApp() {
                         breakCooldown: Math.max(30, Number.isFinite(parseInt(formData.get('breakCooldown'))) ? parseInt(formData.get('breakCooldown')) : 30),
                         reportWaitTime: Number.isFinite(parseInt(formData.get('reportWaitTime'))) && parseInt(formData.get('reportWaitTime')) > 0 ? parseInt(formData.get('reportWaitTime')) : 5,
                         strikeLimit: Number.isFinite(parseInt(formData.get('strikeLimit'))) && parseInt(formData.get('strikeLimit')) > 0 ? parseInt(formData.get('strikeLimit')) : DEFAULT_SETTINGS.strikeLimit,
-                        reportsEnabled: formData.get('reportsEnabled') === 'on',
+                        reportsEnabled: true,
                         useCustomLayout: formData.get('useCustomLayout') === 'on'
                      };
 
@@ -7875,16 +7927,32 @@ function MainApp() {
                          granularWriteTimerRef.current = null;
                        }
                        const save = granularWriteChainRef.current.catch(() => {}).then(async () => {
-                         const ref = getLiveSettingsDoc();
-                         const next = await runTransaction(db, async tx => {
+                         let previousSettings = settingsRef.current;
+                         const ref = db ? getLiveSettingsDoc() : null;
+                         const next = db ? await runTransaction(db, async tx => {
                            const snap = await tx.get(ref);
                            const base = snap.exists() ? { ...DEFAULT_SETTINGS, ...snap.data() } : settingsRef.current;
+                           previousSettings = base;
                            tx.set(ref, settingsPatch, { merge: true });
                            return { ...base, ...settingsPatch };
-                         });
+                         }) : {...settingsRef.current, ...settingsPatch};
                          granularBaselineRef.current.settings = stableJson(next);
                          settingsRef.current = next;
                          setSettings(next);
+                         if (previousSettings.shortBreakCount !== next.shortBreakCount || previousSettings.longBreakCount !== next.longBreakCount) {
+                           for (const localUser of [...usersRef.current]) {
+                             const user = db ? await runTransaction(db, async tx => {
+                               const userRef = getLiveDoc('sgmUsers', localUser.id);
+                               const snapshot = await tx.get(userRef);
+                               if (!snapshot.exists()) return null;
+                               const remote = {...snapshot.data(), id: localUser.id};
+                               const breaks = updatedBreakAllowance(remote, previousSettings, next);
+                               tx.set(userRef, {breaks}, {merge: true});
+                               return {...remote, breaks};
+                             }) : {...localUser, breaks: updatedBreakAllowance(localUser, previousSettings, next)};
+                             if (user) applyCloudRows({user});
+                           }
+                         }
                          return next;
                        });
                        granularWriteChainRef.current = save.catch(() => {});
@@ -7975,6 +8043,16 @@ function MainApp() {
                         </label>
                     </div>
 
+                    <div className="p-4 bg-orange-50 border border-orange-200 rounded-xl space-y-3">
+                      <h3 className="font-bold text-orange-800">Boş Masa İhbarı</h3>
+                      <p className="text-sm text-orange-800">Sistem genelinde açık. Hesabı onaylı ve kısıtsız öğrenciler, mola dışında masada bulunmayan kullanıcıyı ihbar edebilir. Tamamen boş masalar ve moladaki kullanıcılar ihbar edilemez.</p>
+                      <label className="block text-xs font-semibold text-slate-600">İhbar doğrulama süresi (dakika)
+                        <input type="number" name="reportWaitTime" min="1" defaultValue={settings.reportWaitTime} className="w-full p-2 border rounded-lg mt-1" />
+                      </label>
+                      <label className="block text-xs font-semibold text-slate-600">İhlal sınırı
+                        <input type="number" name="strikeLimit" min="1" defaultValue={settings.strikeLimit} className="w-full p-2 border rounded-lg mt-1" />
+                      </label>
+                    </div>
                     <button type="submit" disabled={systemSettingsSaving} className="w-full bg-slate-800 text-white font-bold py-4 rounded-xl shadow-md hover:bg-slate-900 transition-colors disabled:opacity-50">{systemSettingsSaving ? 'Kaydediliyor…' : 'Ayarları Kaydet'}</button>
                   </form>
                 </div>
