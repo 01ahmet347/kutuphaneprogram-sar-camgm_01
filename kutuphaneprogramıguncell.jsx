@@ -1,3 +1,4 @@
+// EK DÜZELTME: Güncel anonim kayıt tokenı, ayrı öğrenci oturumu ve sunucuda atomik yönetici hesabı oluşturma.
 // EK DÜZELTME: Yönetici kaydı güncel Firebase tokenıyla doğrulanır; eski oturum sonuçları yok sayılır.
 // EK DÜZELTME: Hesap onayı/kısıt değişikliği sunucu transaction'ı tamamlanmadan başarılı sayılmaz.
 // Yeni kayıtlar onay beklemeye devam eder; yönetici açıkça onayladığında öğrenci güncellenir.
@@ -871,6 +872,8 @@ function MainApp() {
   const wakeLockRef = useRef(null);
   const wakeLockWantedRef = useRef(false);
   const registrationInFlightRef = useRef(false);
+  const adminCreateRequestRef = useRef(null);
+  const [adminCreatingUser, setAdminCreatingUser] = useState(false);
   
   const [loginIdentity, setLoginIdentity] = useState('');
   const [loginPin, setLoginPin] = useState('');
@@ -4223,17 +4226,30 @@ function MainApp() {
     showMessage("Süre Doldu", `Masa ${expiredDeskId} için 5 dakikalık QR okutma süreniz doldu. Lütfen yeniden masa seçin.`, "warning");
   }, [now, currentUser?.id, selectedDeskId, deskSelectionDeadline]);
 
+  const prepareNewStudentRegistration = () => {
+    if (registrationInFlightRef.current) return;
+    // Yalnızca bu cihazın kayıt ekranı temizlenir; önceki hesap sunucuda korunur.
+    localStorage.removeItem('sgm_registration_account');
+    ['sgm_registration_token', 'sgm_registration_credentials', 'sgm_registration_form_url', 'sgm_registration_form_opened'].forEach(key => sessionStorage.removeItem(key));
+    sessionStorage.setItem('sgm_registration_new_person', '1');
+    setRegistrationPending(''); setRegistrationResult(null); setRegistrationFormUrl('');
+    setRegistrationFormOpened(false); setRegistrationError('');
+    setRegistrationAccepted(false); setRegistrationRulesOpen(true); setShowRules(true);
+  };
+
   const startRegistration = async () => {
     if (!registrationAccepted || registrationInFlightRef.current) return;
     registrationInFlightRef.current = true;
     setRegistrationBusy(true); setRegistrationError('');
     try {
       if (!isDataLoaded) throw new Error('Sistem verileri yüklenene kadar bekleyin.');
+      if (db && auth) await auth.authStateReady();
+      const newPerson = sessionStorage.getItem('sgm_registration_new_person') === '1';
       // Hesap oluşturma Google Form bağlantısından bağımsızdır. Link yalnızca Devam Et adımında kontrol edilir.
       // Aynı cihazda kayıt bilgileri duruyorsa yeni hesap yerine mevcut kısıtlı hesabı göster.
       const saved = (() => { try { return JSON.parse(localStorage.getItem('sgm_registration_account') || 'null'); } catch { return null; } })();
       let registrationAuthUser = auth?.currentUser || fbUser;
-      let user = (usersRef.current || []).find(u => u.id === saved?.userId);
+      let user = newPerson ? null : (usersRef.current || []).find(u => u.id === saved?.userId);
       if (db && user && String(user.id) !== String(registrationAuthUser?.uid)) user = null;
       if (user && (isRecordDeleted('users', user.id) || serverDeletedUserIdsRef.current.has(String(user.id)))) user = null;
       if (!user && saved?.userId) {
@@ -4249,7 +4265,7 @@ function MainApp() {
         if (!auth) throw new Error('Firebase oturumu başlatılamadı.');
         // Silinmiş öğrenci tokenı kayıt API'sine gönderilmez. Doğrulanmış anonim
         // oturum oluşturulur; istemci yeni hesabın kimliğini kendisi seçmez.
-        if (registrationAuthUser && (!registrationAuthUser.isAnonymous ||
+        if (registrationAuthUser && (newPerson || !registrationAuthUser.isAnonymous ||
             serverDeletedUserIdsRef.current.has(String(registrationAuthUser.uid)) ||
             isRecordDeleted('users', registrationAuthUser.uid))) {
           await signOut(auth);
@@ -4257,6 +4273,8 @@ function MainApp() {
           setCurrentUser(null); setSelectedDeskId(null); setDeskSelectionDeadline(null);
         }
         if (!registrationAuthUser) registrationAuthUser = (await signInAnonymously(auth)).user;
+        // İstek kaybolursa tekrar aynı yeni oturum kullanılır; ikinci hesap açılmaz.
+        sessionStorage.removeItem('sgm_registration_new_person');
         setFbUser(registrationAuthUser);
       }
       // Aynı doğrulanmış anonim oturumda eksik yerel hesap, kayıt API'sinden
@@ -4277,13 +4295,20 @@ function MainApp() {
           strikes: 0, blocked: false, canReport: true, createdAt: Date.now()
         });
         if (db) {
-          const idToken = await registrationAuthUser.getIdToken();
-          const response = await fetch('/api/student-register', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
-            body: JSON.stringify({})
-          });
-          const payload = await response.json().catch(() => null);
+          let response, payload;
+          for (let attempt = 0; attempt < 2; attempt++) {
+            // Aynı doğrulanmış anonim UID kullanılır; 401'de yetki atlanmaz.
+            const tokenResult = await registrationAuthUser.getIdTokenResult(true);
+            if (auth.currentUser?.uid !== registrationAuthUser.uid) throw new Error('Kayıt sırasında oturum değişti. Kayıt ekranından tekrar deneyin.');
+            if (tokenResult.claims.firebase?.sign_in_provider !== 'anonymous') throw new Error('Anonim kayıt oturumu doğrulanamadı. Başka öğrenci için yeni kayıt düğmesini kullanın.');
+            response = await fetch('/api/student-register', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenResult.token}` },
+              body: JSON.stringify({})
+            });
+            payload = await response.json().catch(() => null);
+            if (response.status !== 401) break;
+          }
           if (!response.ok || payload?.ok !== true || !payload?.user?.id || !payload?.credentials?.specialCode || !payload?.credentials?.pin) {
             throw new Error(payload?.message || `Kayıt servisi HTTP ${response.status} döndürdü.`);
           }
@@ -6348,20 +6373,56 @@ function MainApp() {
     showMessage('İşlem Geri Alındı', `${snapshot.label} işlemi öncesindeki durum geri yüklendi.`, 'success');
   };
 
-  const createAutomaticUser = () => {
+  const createAutomaticUser = async () => {
+    if (adminCreatingUser) return;
     const name = window.prompt('Yeni kişinin gerçek adını ve soyadını yazın:');
     if (!name?.trim()) return;
     const current = usersRef.current || [];
     if (current.some(u => cleanNameFormat(u.name) === cleanNameFormat(name))) return showMessage('Kayıt Zaten Var', 'Bu kişi için yeniden GM Özel Kod oluşturulamaz. Mevcut kaydı kontrol edin.', 'warning');
-    const identityNo=createEightDigitCode(new Set(current.map(u=>u.identityNo)));
-    const pin=createEightDigitCode(new Set(current.map(u=>u.pin)));
-    const specialCode=createEightDigitCode(new Set(current.map(u=>u.specialCode)));
-    const newUser={id:'U'+generateId(),name:name.trim(),identityNo,pin,specialCode,pendingApproval:true,restrictionReason:'Sorumlu onayı bekleniyor',restrictedUntil:0,activeDeskId:null,breaks:{short:settings.shortBreakCount,long:settings.longBreakCount},strikes:0,blocked:false,canReport:true};
-    pushUndoSnapshot('Yeni kullanıcı oluşturma');
-    pendingUserCreatesRef.current.add(String(newUser.id));
-    usersRef.current=[...current,newUser]; setUsers(usersRef.current);
-    addLog('ADMIN_KULLANICI_OLUSTUR', 'Yeni kullanıcı için GM Özel Kod ve şifre üretildi; hesap onay bekliyor.', null, newUser.id);
-    showMessage('Bilgilerinizi Kaydedin', `GM Özel Kod: ${specialCode}\nŞifre: ${pin}\nKütüphane sorumlumuz ile iletişime geçin.`, 'success');
+    setAdminCreatingUser(true);
+    try {
+      pushUndoSnapshot('Yeni kullanıcı oluşturma');
+      let newUser;
+      if (db) {
+        if (!auth) throw new Error('Firebase yönetici oturumu bulunamadı.');
+        await auth.authStateReady();
+        const adminUser = auth.currentUser;
+        if (!adminUser) throw new Error('Yönetici paneline yeniden giriş yapın.');
+        const tokenResult = await adminUser.getIdTokenResult(true);
+        if (tokenResult.claims.admin !== true) throw new Error('Yönetici yetkisi gerekli.');
+        if (!adminCreateRequestRef.current || adminCreateRequestRef.current.name !== name.trim()) {
+          adminCreateRequestRef.current = {name: name.trim(), requestId: crypto.randomUUID ? crypto.randomUUID() : 'ADMIN-' + Date.now() + '-' + generateId()};
+        }
+        const response = await fetch('/api/admin-student-create', {
+          method: 'POST', headers: {'Content-Type': 'application/json', Authorization: `Bearer ${tokenResult.token}`},
+          body: JSON.stringify(adminCreateRequestRef.current)
+        });
+        const payload = await response.json().catch(() => null);
+        if (!response.ok || payload?.ok !== true || !payload.user?.id) throw new Error(payload?.message || `Hesap servisi HTTP ${response.status} döndürdü.`);
+        if (auth.currentUser?.uid !== adminUser.uid) throw new Error('Hesap kaydedildi ancak yönetici oturumu değişti. Yönetici panelinden listeyi kontrol edin.');
+        newUser = payload.user;
+        granularBaselineRef.current.users.set(String(newUser.id), newUser);
+      } else {
+        const localRows = usersRef.current || [];
+        const identityNo = createEightDigitCode(new Set(localRows.map(u => u.identityNo)));
+        const pin = createEightDigitCode(new Set(localRows.map(u => u.pin)));
+        const specialCode = createEightDigitCode(new Set(localRows.map(u => u.specialCode)));
+        newUser = {id: 'U' + (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + generateId()), name: name.trim(), identityNo, pin, specialCode,
+          pendingApproval: true, restrictionReason: 'Sorumlu onayı bekleniyor', restrictedUntil: 0,
+          activeDeskId: null, breaks: {short: settings.shortBreakCount, long: settings.longBreakCount}, strikes: 0, blocked: false, canReport: true};
+        pendingUserCreatesRef.current.add(String(newUser.id));
+      }
+      // Yeni hesap ayrı kimlikle eklenir; mevcut hesapların üstüne yazılmaz.
+      const latest = usersRef.current || [];
+      usersRef.current = [...latest.filter(u => u.id !== newUser.id), newUser]; setUsers(usersRef.current);
+      localStorage.setItem('sgm_users', JSON.stringify(usersRef.current));
+      adminCreateRequestRef.current = null;
+      addLog('ADMIN_KULLANICI_OLUSTUR', 'Yeni kullanıcı ayrı kimlikle oluşturuldu; hesap onay bekliyor.', null, newUser.id);
+      showMessage('Bilgilerinizi Kaydedin', `GM Özel Kod: ${newUser.specialCode}\nŞifre: ${newUser.pin}\nKütüphane sorumlumuz ile iletişime geçin.`, 'success');
+    } catch (error) {
+      handleFirestoreQuotaError(error);
+      showMessage('Hesap Oluşturulamadı', error.message, 'warning');
+    } finally { setAdminCreatingUser(false); }
   };
 
   const bulkUserAction = async (action) => {
@@ -7141,6 +7202,7 @@ function MainApp() {
                 <button type="submit" className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-4 rounded-xl flex items-center justify-center gap-2 shadow-lg shadow-blue-200">Giriş Yap <LogIn className="w-5 h-5" /></button>
                 <button type="button" onClick={()=>{setRegistrationAccepted(false);setRegistrationRulesOpen(true);setShowRules(true);}} className="w-full py-3 border border-blue-300 text-blue-700 rounded-xl font-bold">Kayıt Ol</button>
                 {registrationPending && registrationFormOpened && <p className="text-sm text-blue-700">Kayıt formuna <b>GM özel kodunu yazmayı unutmayın.</b> Formu gönderin; yönetici kontrol ettikten sonra kısıtı kaldıracaktır.</p>}
+                <button type="button" disabled={registrationBusy} onClick={prepareNewStudentRegistration} className="text-sm font-bold text-blue-700 disabled:opacity-50">Başka öğrenci için yeni kayıt</button>
                 {registrationError && <p role="alert" className="text-sm text-red-700">{registrationError}</p>}
                 {registrationResult && <div className="p-4 bg-amber-50 border border-amber-200 rounded-xl space-y-3">
                   <div className="font-black text-amber-900 text-lg">Önemli: Bu bilgileri unutmayın ve kaybetmeyin!</div>
@@ -7732,7 +7794,7 @@ function MainApp() {
                     <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
                       <div><h2 className="text-xl font-black text-slate-800">Otomatik Kullanıcı Üretimi</h2><p className="text-sm text-slate-500 mt-1">GM Özel Kod ve 8 haneli şifre sistem tarafından otomatik ve benzersiz üretilir.</p></div>
                       <div className="flex flex-wrap gap-2">
-                        <button onClick={createAutomaticUser} className="px-5 py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-bold flex items-center gap-2"><Plus className="w-5 h-5"/> Yeni Kişi Oluştur</button>
+                        <button disabled={adminCreatingUser} onClick={createAutomaticUser} className="px-5 py-3 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-xl font-bold flex items-center gap-2"><Plus className="w-5 h-5"/> Yeni Kişi Oluştur</button>
                         <button onClick={undoLastAdminOperation} disabled={!getCurrentTabUndoSnapshot()} className="px-5 py-3 bg-amber-100 hover:bg-amber-200 disabled:bg-slate-100 disabled:text-slate-400 text-amber-800 rounded-xl font-bold flex items-center gap-2"><RefreshCw className="w-5 h-5"/> Geri Al</button>
                       </div>
                     </div>
