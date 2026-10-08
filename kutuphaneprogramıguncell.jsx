@@ -1,3 +1,10 @@
+// 2026-10-08 EK SENKRONİZASYON DÜZELTMELERİ:
+// - Silinen öğrenci hesabının cihaz oturumu ve ilgili kayıt önbelleği temizlenir.
+// - Yönetici listesinde eski yerel kullanıcılar sunucu silmesini geri alamaz.
+// - Öğrenci krokisi güncel sunucu masa durumunu kullanır.
+// - Masa bırakma güncel masa kimliğiyle yapılır; sunucu sonucu doğrulanır.
+// - Kayıt servisi /api/student-register ve sunucu masa işlemleri ayrı dosyalardır.
+//   Kayıt kurtarma, güncellenmiş api/student-register.js ile birlikte çalışır.
 // EK DÜZELTMELER: giriş/oturum logları, QR mola dönüşü, ihbar hedefi,
 // ortak hesap kısıtı + YP ihbar yetkisi görünümü, önceki kapanış kurtarma.
 // Bu dosya mevcut React dosyanızın yerine kullanılır; diğer importlar korunmuştur.
@@ -1904,8 +1911,10 @@ function MainApp() {
   const mergeRemoteWithPendingLocal = (bucket, remoteRows, localRows) => {
     const raw = Array.isArray(remoteRows) ? remoteRows : [];
     const previous = granularBaselineRef.current[bucket] || new Map();
-    if (bucket === 'users' && granularSeenRemoteRef.current.users) {
-      for (const id of previous.keys()) {
+    if (bucket === 'users') {
+      // Tam yönetici snapshot'ında bulunmayan eski yerel kullanıcıyı geri ekleme.
+      const knownIds = new Set([...previous.keys(), ...(localRows || []).map(u => String(u.id))]);
+      for (const id of knownIds) {
         if (!raw.some(row => String(row.id) === id) && !pendingUserCreatesRef.current.has(id)) {
           serverDeletedUserIdsRef.current.add(id);
         }
@@ -2154,7 +2163,33 @@ function MainApp() {
           ? normalizeRemoteUsers([{ ...snapshot.data(), id: snapshot.id }], settingsRef.current) : [];
         usersRef.current = rows;
         setUsers(rows);
-        if (rows[0]) granularBaselineRef.current.users.set(String(rows[0].id), rows[0]);
+        if (rows[0]) {
+          const id = String(rows[0].id);
+          serverDeletedUserIdsRef.current.delete(id);
+          granularBaselineRef.current.users.set(id, rows[0]);
+        } else {
+          // Yalnızca önceden bilinen, doğrulanmış hesabın sunucu snapshot'ı
+          // silme kanıtıdır. Anonim oturumdaki boş belge yeni kaydı engellemez.
+          const id = String(fbUser.uid);
+          const savedSession = (() => { try { return JSON.parse(localStorage.getItem('sgm_student_session') || 'null'); } catch { return null; } })();
+          if (granularBaselineRef.current.users.has(id) || savedSession?.userId === id) {
+            serverDeletedUserIdsRef.current.add(id);
+            granularBaselineRef.current.users.delete(id);
+            localStorage.removeItem('sgm_student_session');
+            localStorage.removeItem('sgm_users');
+            setCurrentUser(previous => previous?.id === id ? null : previous);
+            setSelectedDeskId(null); setDeskSelectionDeadline(null);
+            setScannerConfig({isOpen: false, mode: null, title: ''});
+            setView(previous => previous === 'student_dash' || previous === 'student_feedback' ? 'student_login' : previous);
+            const savedRegistration = (() => { try { return JSON.parse(localStorage.getItem('sgm_registration_account') || 'null'); } catch { return null; } })();
+            if (savedRegistration?.userId === id) {
+              localStorage.removeItem('sgm_registration_account');
+              ['sgm_registration_token', 'sgm_registration_credentials', 'sgm_registration_form_url', 'sgm_registration_form_opened'].forEach(key => sessionStorage.removeItem(key));
+              setRegistrationPending(''); setRegistrationResult(null); setRegistrationFormUrl(''); setRegistrationFormOpened(false);
+            }
+          }
+        }
+        localStorage.setItem('sgm_users', JSON.stringify(rows));
       }
       markGranularLoaded('users');
     }, error => {
@@ -2261,7 +2296,7 @@ function MainApp() {
             ? query(getLiveCollection(firestoreName), orderBy('time', 'desc'), limit(500))
             : getLiveCollection(firestoreName);
           const unsub = onSnapshot(source, { includeMetadataChanges: true }, snapshot => {
-            if (snapshot.metadata.fromCache) return;
+            if (cancelled || snapshot.metadata.fromCache) return;
             let remoteRows = snapshot.docs.map(d => ({ ...d.data(), id: d.data()?.id ?? d.id }));
             remoteRows = normalizeRows(remoteRows);
             // Kısmen oluşmuş koleksiyonda da eksik 35 masa ve QR kayıtları tamamlanır.
@@ -2277,9 +2312,17 @@ function MainApp() {
               }
             }
             if (key === 'users') remoteRows = normalizeRemoteUsers(remoteRows, settingsRef.current);
-            const mergedRows = ['desks', 'users'].includes(key)
-              ? mergeRemoteWithPendingLocal(key, remoteRows, getLocalRows())
-              : remoteRows;
+            // Öğrenci masa işlemleri API tarafından yazılır. Öğrenci cihazındaki
+            // eski doluluk bilgisi sunucunun boş masa kaydını ezmemelidir.
+            const mergedRows = key === 'desks' && !adminDataMode
+              ? remoteRows
+              : ['desks', 'users'].includes(key)
+                ? mergeRemoteWithPendingLocal(key, remoteRows, getLocalRows())
+                : remoteRows;
+            if (key === 'desks' && !adminDataMode) {
+              granularBaselineRef.current.desks = rowsToMap(remoteRows);
+              granularSeenRemoteRef.current.desks = true;
+            }
             // Baseline eksik QR'ı taşıdığı için mevcut senkronizasyon yalnızca onarılan
             // masa belgelerini bir kez kaydeder; eski QR'lar değiştirilmez.
             applyRows(key === 'desks' ? normalizeDeskQrRows(mergedRows) : mergedRows);
@@ -4095,9 +4138,12 @@ function MainApp() {
       // Aynı cihazda kayıt bilgileri duruyorsa yeni hesap yerine mevcut kısıtlı hesabı göster.
       const saved = JSON.parse(localStorage.getItem('sgm_registration_account') || 'null');
       let user = (usersRef.current || []).find(u => u.id === saved?.userId);
-      if (!user && saved?.userId && db && fbUser) {
-        throw new Error('Mevcut kayıt bilgileri henüz senkronize edilmedi. Yeni hesap açmadan önce sorumlu ile iletişime geçin.');
+      if (!user && saved?.userId && db && fbUser && String(saved.userId) !== String(fbUser.uid)) {
+        // Başka/yenilenmiş tarayıcı kimliğiyle eski hesabın yerine yeni hesap açma.
+        throw new Error('Bu cihazda önceki bir hesap kaydı var ancak oturum kimliği değişmiş. Mevcut GM Özel Kod ve şifrenizle giriş yapın; bilgilerinizi bilmiyorsanız sorumlu ile iletişime geçin.');
       }
+      // Aynı doğrulanmış anonim oturumda eksik yerel hesap, kayıt API'sinden
+      // yeniden getirilir. API mevcut hesabı döndürür; kod/şifre değiştirilmez.
       if (!user) {
         const token = crypto.randomUUID ? crypto.randomUUID() : 'REG-' + Date.now() + '-' + generateId();
         const createUser = rows => ({
@@ -4123,6 +4169,9 @@ function MainApp() {
           const payload = await response.json().catch(() => null);
           if (!response.ok || payload?.ok !== true || !payload?.user?.id || !payload?.credentials?.specialCode || !payload?.credentials?.pin) {
             throw new Error(payload?.message || `Kayıt servisi HTTP ${response.status} döndürdü.`);
+          }
+          if (String(payload.user.id) !== String(fbUser.uid)) {
+            throw new Error('Kayıt sonucu doğrulanmış cihaz oturumuyla eşleşmiyor.');
           }
           user = { ...payload.user, ...payload.credentials };
           granularBaselineRef.current.users.set(String(user.id), user);
@@ -4589,7 +4638,11 @@ function MainApp() {
   };
 
   const releaseDesk = () => {
-    if (!currentUser || !currentUser.activeDeskId) return;
+    if (!currentUser) return;
+    const latestUser = usersRef.current.find(u => u.id === currentUser.id);
+    const ownedDesk = desksRef.current.find(d => d.occupant === currentUser.id || d.guestOccupant === currentUser.id);
+    const releaseDeskId = ownedDesk?.id || latestUser?.activeDeskId || currentUser.activeDeskId;
+    if (!releaseDeskId) return showMessage('Masa Bilgisi', 'Aktif masa kaydı bulunamadı. Güncel masa bilgilerini kontrol edin.', 'warning');
 
     setModal({
         isOpen: true,
@@ -4602,12 +4655,19 @@ function MainApp() {
                     <button onClick={closeMessage} className="flex-1 py-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl font-bold transition-colors">İptal</button>
                     <button onClick={async () => {
                         const leavingUserId = currentUser.id;
-                        const deskId = currentUser.activeDeskId;
+                        const deskId = releaseDeskId;
                         const nowTime = Date.now();
 
                         if (db) {
                           try {
                             const result = await runStudentDeskAction('leave', { deskId });
+                            if (!result?.desk && !result?.desks?.length) {
+                              throw new Error('Sunucu masa bırakma işleminin güncel masa kaydını döndürmedi. İşlem doğrulanamadı.');
+                            }
+                            const returnedDesk = result.desk || result.desks.find(d => Number(d.id) === Number(deskId));
+                            if (!returnedDesk || returnedDesk.occupant === leavingUserId || returnedDesk.guestOccupant === leavingUserId) {
+                              throw new Error('Sunucu kaydında masa hâlâ hesabınıza bağlı. Masa bırakma işlemi tamamlanmadı.');
+                            }
                             applyCloudRows(result);
                             confirmedDeskGuardRef.current = null;
                             pendingReservationGuardRef.current = null;
