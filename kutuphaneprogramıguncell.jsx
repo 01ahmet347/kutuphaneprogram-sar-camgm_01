@@ -1,3 +1,4 @@
+// 2026-10-08: Push anahtarı YP üzerinden kaydedilir; .exists sunucu uyumsuzluğu düzeltme paketiyle giderilir.
 // 2026-10-08: Giriş bağlantısı kaldırıldı; YP isimsiz otomatik kayıt; rezervasyon iptali; sabit QR ve QR yedek sekmesi.
 // EK DÜZELTME: Firebase ve öğrenci oturumları sekmeye özeldir; yetkisiz yönetici görünümü girişe döner.
 // EK DÜZELTME: Ayar kaydı ihbarı kapatmaz; yönetici listesi oturum kapsamında dinlenir.
@@ -243,6 +244,18 @@ const cleanNameFormat = (str) => {
       .toLocaleLowerCase('tr-TR');
 };
 
+// VAPID, Firebase Web Push sertifikasının herkese açık anahtarıdır.
+// Gizli anahtar / servis hesabı bilgileri bu alana kaydedilmez.
+const normalizeFirebaseVapidKey = value => String(value || '').trim().replace(/\s+/g, '');
+const isValidFirebaseVapidKey = value => {
+  const key = normalizeFirebaseVapidKey(value);
+  if (!/^[A-Za-z0-9_-]{87}=?$/.test(key)) return false;
+  try {
+    const bytes = atob(key.replace(/-/g, '+').replace(/_/g, '/') + (key.endsWith('=') ? '' : '='));
+    return bytes.length === 65 && bytes.charCodeAt(0) === 4;
+  } catch { return false; }
+};
+
 const DEFAULT_SETTINGS = {
   openTime: '07:00',
   closeTime: '22:00',
@@ -265,6 +278,8 @@ const DEFAULT_SETTINGS = {
   registrationFormUrl: '',
   registrationFormHistory: [],
   registrationFormUpdatedAt: 0,
+  firebaseWebPushVapidKey: '',
+  firebaseWebPushVapidUpdatedAt: 0,
 };
 
 const INITIAL_DESKS = Array.from({ length: 35 }, (_, i) => ({
@@ -406,10 +421,15 @@ const mergeRegistrationSettings = (base = {}, incoming = {}) => {
   const preserveBase = Number(base.registrationFormUpdatedAt || 0) > Number(incoming.registrationFormUpdatedAt || 0) ||
     (!!baseUrl && !incomingUrl && !Number(incoming.registrationFormUpdatedAt || 0));
   const chosen = preserveBase ? base : incoming;
+  // Eski açık cihazın ayarları yeni kaydedilmiş VAPID anahtarını ezmesin.
+  const pushChosen = Number(base.firebaseWebPushVapidUpdatedAt || 0) > Number(incoming.firebaseWebPushVapidUpdatedAt || 0)
+    ? base : incoming;
   return { ...base, ...incoming,
     registrationFormUrl: normalizeRegistrationUrl(chosen.registrationFormUrl),
     registrationFormHistory: Array.isArray(chosen.registrationFormHistory) ? chosen.registrationFormHistory : [],
-    registrationFormUpdatedAt: Number(chosen.registrationFormUpdatedAt || 0)
+    registrationFormUpdatedAt: Number(chosen.registrationFormUpdatedAt || 0),
+    firebaseWebPushVapidKey: normalizeFirebaseVapidKey(pushChosen.firebaseWebPushVapidKey),
+    firebaseWebPushVapidUpdatedAt: Number(pushChosen.firebaseWebPushVapidUpdatedAt || 0)
   };
 };
 const validRegistrationUrl = value => {
@@ -1240,6 +1260,45 @@ function MainApp() {
   });
   const [pushTestSendingUserId, setPushTestSendingUserId] = useState(null);
   const [manualWorkerBusy, setManualWorkerBusy] = useState(false);
+  const [pushVapidDraft, setPushVapidDraft] = useState('');
+  const [pushVapidSaving, setPushVapidSaving] = useState(false);
+  const pushVapidSaveInFlightRef = useRef(false);
+  const pushVapidDraftDirtyRef = useRef(false);
+  useEffect(() => {
+    if (!pushVapidDraftDirtyRef.current) setPushVapidDraft(normalizeFirebaseVapidKey(settings.firebaseWebPushVapidKey));
+  }, [settings.firebaseWebPushVapidKey]);
+  const resolveFirebaseVapidKey = () => normalizeFirebaseVapidKey(
+    settingsRef.current.firebaseWebPushVapidKey || import.meta.env.VITE_FIREBASE_VAPID_KEY || ''
+  );
+  const saveFirebaseVapidKey = async () => {
+    if (pushVapidSaveInFlightRef.current) return;
+    const key = normalizeFirebaseVapidKey(pushVapidDraft);
+    if (!isValidFirebaseVapidKey(key)) return showMessage('VAPID Anahtarını Kontrol Edin',
+      'Firebase projenizin Cloud Messaging → Web Push certificates bölümündeki Public key değerini eksiksiz yapıştırın.', 'warning');
+    pushVapidSaveInFlightRef.current = true; setPushVapidSaving(true);
+    try {
+      if (db && (!adminAuthorized || !fbUser || !navigator.onLine)) throw new Error('VAPID anahtarını kaydetmek için yönetici bağlantısı gerekli.');
+      let next;
+      if (db) {
+        next = await runTransaction(db, async tx => {
+          const ref = getLiveSettingsDoc(); const snap = await tx.get(ref);
+          const base = mergeRegistrationSettings(settingsRef.current, snap.exists() ? snap.data() : settingsRef.current);
+          const patch = { firebaseWebPushVapidKey: key,
+            firebaseWebPushVapidUpdatedAt: Math.max(Date.now(), Number(base.firebaseWebPushVapidUpdatedAt || 0) + 1) };
+          tx.set(ref, patch, { merge: true });
+          return { ...base, ...patch };
+        });
+        granularBaselineRef.current.settings = next;
+      } else next = { ...settingsRef.current, firebaseWebPushVapidKey: key, firebaseWebPushVapidUpdatedAt: Date.now() };
+      settingsRef.current = next; setSettings(next);
+      pushVapidDraftDirtyRef.current = false; setPushVapidDraft(key);
+      try { localStorage.setItem('sgm_settings', JSON.stringify(next)); } catch (error) { console.warn('Push ayar önbelleği yazılamadı:', error); }
+      setPushDiagnostics(prev => ({ ...prev, vapidConfigured: true }));
+      addLog('ADMIN_PUSH_AYAR', 'Firebase Web Push herkese açık VAPID anahtarı kaydedildi.');
+      showMessage('Push Anahtarı Kaydedildi', 'Öğrenci telefonunda Bildirimleri Aç / Push Kaydı düğmesine yeniden basın.', 'success');
+    } catch (error) { handleFirestoreQuotaError(error); showMessage('Push Ayarı Kaydedilemedi', error.message, 'warning'); }
+    finally { pushVapidSaveInFlightRef.current = false; setPushVapidSaving(false); }
+  };
 
   const refreshPushDiagnostics = async () => {
     setPushDiagnostics(prev => ({ ...prev, loading: true }));
@@ -1247,7 +1306,7 @@ function MainApp() {
     const notificationSupported = typeof window !== 'undefined' && 'Notification' in window;
     const notificationPermission = notificationSupported ? Notification.permission : 'unsupported';
     const serviceWorkerSupported = typeof navigator !== 'undefined' && 'serviceWorker' in navigator;
-    const vapidConfigured = !!String(import.meta.env.VITE_FIREBASE_VAPID_KEY || '').trim();
+    const vapidConfigured = isValidFirebaseVapidKey(resolveFirebaseVapidKey());
 
     let serviceWorkerActive = false;
     let messagingSupported = false;
@@ -2603,7 +2662,8 @@ function MainApp() {
   // ============================================================
   // GERÇEK TELEFON PUSH BİLDİRİMİ - FIREBASE CLOUD MESSAGING (FCM)
   // ============================================================
-  // Vercel Environment Variables içine VITE_FIREBASE_VAPID_KEY eklenmiş olmalıdır.
+  // Gerçek Firebase Web Push Public key YP → Push Durumu ekranından kaydedilebilir.
+  // Mevcut VITE_FIREBASE_VAPID_KEY ortam değişkeni desteği de korunmuştur.
   // public/firebase-messaging-sw.js dosyasının da projede bulunması gerekir.
   //
   // Bu fonksiyon mevcut bildirim sistemini kaldırmaz.
@@ -2710,12 +2770,15 @@ function MainApp() {
         );
       }
 
-      const vapidKey = String(import.meta.env.VITE_FIREBASE_VAPID_KEY || '').trim();
+      const vapidKey = resolveFirebaseVapidKey();
 
       if (!vapidKey) {
-        return fail('6_vapid_eksik', 'VITE_FIREBASE_VAPID_KEY tanımlı değil.');
+        return fail('6_vapid_eksik', 'Push bildirim anahtarı henüz ayarlanmamış. Kütüphane sorumlusu YP → Push Durumu bölümünden Firebase Web Push Public key değerini kaydetmelidir.');
       }
 
+      if (!isValidFirebaseVapidKey(vapidKey)) {
+        return fail('6_vapid_gecersiz', 'Push anahtarı geçersiz. YP → Push Durumu bölümündeki Firebase Web Push Public key değerini kontrol edin.');
+      }
       markStage('6_vapid_bulundu', {
         pushVapidLength: vapidKey.length
       });
@@ -4285,7 +4348,9 @@ function MainApp() {
       if (oldDeskId) addLog('MASA_SECIM_IPTAL', reason, oldDeskId, userId);
     } catch (error) {
       handleFirestoreQuotaError(error);
-      showMessage('Rezervasyon İptal Edilemedi', error.message, 'warning');
+      showMessage('Rezervasyon İptal Edilemedi', /\b\w+\.exists is not a function\b/.test(error.message || '')
+        ? 'Masa servisinde belge kontrolü hatası var. Sunucu dosyalarındaki düzeltme uygulanmalıdır. Rezervasyonunuz henüz iptal edilmedi.'
+        : error.message, 'warning');
     } finally {
       deskCancellationRef.current = false;
       deskActionInFlightRef.current = false;
@@ -8416,6 +8481,14 @@ function MainApp() {
 
               {adminTab === 'push_status' && (
                 <div className="space-y-6">
+                  <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 space-y-3">
+                    <h3 className="text-lg font-bold text-slate-800">Firebase Web Push Anahtarı</h3>
+                    <p className="text-sm text-slate-600">Bu uygulamanın Firebase projesinde Proje ayarları → Cloud Messaging → Web Push certificates bölümündeki <b>Public key</b> değerini buraya yapıştırın. Henüz oluşturulmadıysa aynı bölümde Generate key pair seçeneğini kullanın.</p>
+                    <label htmlFor="firebase-vapid-key" className="block text-sm font-bold text-slate-700">Herkese açık VAPID anahtarı</label>
+                    <textarea id="firebase-vapid-key" rows={3} value={pushVapidDraft} onChange={e => { pushVapidDraftDirtyRef.current = true; setPushVapidDraft(e.target.value); }} placeholder="Firebase Web Push Public key" className="w-full border border-slate-300 p-3 rounded-xl font-mono text-sm break-all" spellCheck={false}/>
+                    <button type="button" disabled={pushVapidSaving} onClick={saveFirebaseVapidKey} className="px-5 py-3 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-xl font-bold">{pushVapidSaving ? 'Kaydediliyor…' : 'Push Anahtarını Kaydet'}</button>
+                    <p className="text-xs text-slate-500">Kaydedilen anahtar diğer cihazlara otomatik aktarılır. Mevcut VITE_FIREBASE_VAPID_KEY ayarı da desteklenir. Bu alana Private key veya servis hesabı JSON bilgisi girilmez.</p>
+                  </div>
                   <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
                     <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
                       <div>
