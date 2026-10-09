@@ -7311,7 +7311,7 @@ function MainApp() {
                   <div className="flex items-center gap-4">
                     <div className="w-12 h-12 bg-green-50 text-green-600 rounded-xl flex items-center justify-center group-hover:bg-green-600 group-hover:text-white transition-colors"><Eye className="w-6 h-6"/></div>
                     <div className="text-left">
-                      <h3 className="font-bold text-slate-800 text-lg">Halka Açık Ekran</h3>
+                      <h3 className="font-bold text-slate-800 text-lg">Herkese Açık Ekran</h3>
                       <p className="text-slate-500 text-sm">Anlık masa doluluk durumu</p>
                     </div>
                   </div>
