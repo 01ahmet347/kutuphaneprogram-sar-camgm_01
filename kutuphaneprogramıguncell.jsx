@@ -2019,27 +2019,94 @@ function MainApp() {
   const [adminUsersServerReady, setAdminUsersServerReady] = useState(false);
   const [cachedUsersDifference, setCachedUsersDifference] = useState(0);
 
-  // A new manager revokes the previous manager in both Rules and the open UI.
+  // Yönetici oturumunu sadece sunucunun kesin kararına göre kapat.
+  // Firestore'un önbellekteki eski aktif oturum bilgisi veya izin/ağ hatası
+  // özellikle PC tarayıcılarında birkaç saniye sonra yanlış çıkışa yol açıyordu.
   useEffect(() => {
     if (!db || !adminAuthorized || fbUser?.uid !== 'sgm-admin') return;
     let stopped = false;
     let unsubscribe = () => {};
+    let checking = false;
+    let sessionId = null;
+
     const replaced = () => {
-      if (stopped) return;
+      if (stopped || auth?.currentUser?.uid !== 'sgm-admin') return;
+      stopped = true;
       setAdminAuthorized(false);
       setView(previous => previous === 'admin_dash' ? 'admin_login' : previous);
-      if (auth?.currentUser?.uid === 'sgm-admin') signOut(auth).catch(() => {});
+      showMessage('Yönetici Oturumu Sona Erdi', 'Başka bir yönetici giriş yaptığı için bu yönetici oturumu kapatıldı.', 'warning');
+      signOut(auth).catch(() => {});
     };
+
+    const verifyWithServer = async () => {
+      if (stopped || checking || !sessionId || !navigator.onLine) return;
+      checking = true;
+      try {
+        const liveUser = auth?.currentUser;
+        if (liveUser?.uid !== 'sgm-admin') return;
+        const token = await liveUser.getIdToken();
+        const response = await fetch('/api/admin-session', {
+          method: 'GET',
+          headers: { Authorization: `Bearer ${token}` },
+          cache: 'no-store'
+        });
+        if (response.status !== 403) return; // 401/503/ağ hatası: oturumu yanlışlıkla kapatma.
+        const result = await response.json().catch(() => null);
+        if (result?.error !== 'admin_session_replaced') return;
+        // Eşzamanlı yeni bir yönetici girişi aynı Firebase UID'yi kullanır.
+        // Eski dinleyicinin cevabı yeni oturumu kapatmamalı.
+        const current = auth?.currentUser;
+        const currentClaims = await current?.getIdTokenResult();
+        if (!stopped && current?.uid === 'sgm-admin' && currentClaims?.claims?.adminSessionId === sessionId) replaced();
+      } catch (error) {
+        // Bağlantı ve Firestore okuma sorunları başka yönetici girişi değildir.
+        console.warn('Yönetici oturumu geçici olarak doğrulanamadı:', error?.code || error?.message);
+      } finally {
+        checking = false;
+      }
+    };
+
+    const onVisible = () => { if (document.visibilityState === 'visible') void verifyWithServer(); };
+    const timer = setInterval(() => { if (document.visibilityState === 'visible') void verifyWithServer(); }, 60000);
+    window.addEventListener('focus', verifyWithServer);
+    window.addEventListener('online', verifyWithServer);
+    document.addEventListener('visibilitychange', onVisible);
+
     fbUser.getIdTokenResult().then(token => {
       if (stopped) return;
-      const sessionId = token.claims.adminSessionId;
-      if (!sessionId) return replaced();
+      sessionId = token.claims.adminSessionId;
+      if (!sessionId) {
+        // Eksik/eskimiş token için görünümü düşürmeden yeni giriş gerektiğini bildir.
+        console.warn('Yönetici oturum kimliği token içinde bulunamadı.');
+        return;
+      }
+      // Aktif oturum belgesi gerçek sunucudan geldiğinde hızlı tepki verir.
+      // Önbellekteki eski belge ve dinleyici hataları tek başına çıkış sebebi değildir.
       unsubscribe = onSnapshot(getLiveDoc('sgmAdminSessions', 'active'),
-        snap => { if (!snap.exists() || snap.data().sessionId !== sessionId) replaced(); },
-        () => replaced());
-    }).catch(replaced);
-    return () => { stopped = true; unsubscribe(); };
-  }, [adminAuthorized, fbUser?.uid]);
+        { includeMetadataChanges: true },
+        snap => {
+          if (stopped || snap.metadata.fromCache) return;
+          if (!snap.exists() || snap.data()?.sessionId !== sessionId) void verifyWithServer();
+        },
+        error => {
+          if (stopped) return;
+          console.warn('Yönetici oturum dinleyicisi kullanılamadı, sunucudan kontrol edilecek:', error?.code || 'unknown');
+          void verifyWithServer();
+        });
+      void verifyWithServer();
+    }).catch(error => {
+      // Anlık token yenileme hatasında PC ekranını kapatma.
+      if (!stopped) console.warn('Yönetici tokenı geçici olarak okunamadı:', error?.code || 'unknown');
+    });
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+      window.removeEventListener('focus', verifyWithServer);
+      window.removeEventListener('online', verifyWithServer);
+      document.removeEventListener('visibilitychange', onVisible);
+      unsubscribe();
+    };
+  }, [adminAuthorized, fbUser]);
 
   const stableJson = value => {
     try { return JSON.stringify(value); } catch { return ''; }
@@ -6524,7 +6591,7 @@ function MainApp() {
   const myDesk = myUserObj && myUserObj.activeDeskId ? safeDesksList.find(d => d.id === myUserObj.activeDeskId) : null;
   const studentRestricted = !myUserObj || ((myUserObj.blocked || isRestricted(myUserObj, now)) &&
     !(myUserObj.activeDeskId && Number(myUserObj.adminDeskOverrideDeskId) === Number(myUserObj.activeDeskId) &&
-      Number(myDesk?.sessionStartTime) === Number(myUserObj.adminDeskOverrideSessionStart)));
+      Number(myDesk?.sessionStartTime) === Number(myUserObj.adminDeskOverrideSessionStart))); 
   const studentDeskWait = deskWaitRemaining(myUserObj, now);
   const filteredUsers = safeUsersList.filter(u => !userSearch.trim() || [u.name, u.specialCode, u.pin].some(value => String(value || '').toLocaleLowerCase('tr-TR').includes(userSearch.trim().toLocaleLowerCase('tr-TR'))));
   const visibleLogs = [...new Map([...archivedLogs, ...(Array.isArray(logs) ? logs : [])].filter(l => !isRecordDeleted('logs', l.id) && !quietAuditEvents.has(l.type)).map(l => [l.id, l])).values()].sort((a,b) => b.time - a.time);

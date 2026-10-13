@@ -1,3 +1,19 @@
+# PC yönetici oturumu düzeltmesi — 13.10.2026 (2026.10.13.2)
+
+Bu paket bir önceki 2026.10.13.1 projesindeki bütün düzenlemeleri korur. **Yalnızca yönetici oturumunun yanlış sonlanması** için ek düzeltme içerir.
+
+**Sorun:** PC tarayıcısında Firestore `sgmAdminSessions/active` dinleyicisi ilk olarak önbellekteki eski değeri döndürdüğünde, geçici ağ hatası veya `permission-denied` aldığında yönetici gerçek oturumu geçerli olsa dahi birkaç saniye içinde giriş ekranına gönderiliyordu.
+
+**Düzeltme:** Yeni `/api/admin-session` endpoint'i Firebase kimliğini ve en son etkin yöneticinin sunucu oturumunu doğrular. Tarayıcı ancak sunucu **403 `admin_session_replaced`** cevabını doğrularsa mevcut yönetici oturumunu kapatır. Önbellek veya geçici bağlantı/izin hatası çıkışa neden olmaz. Etkin yönetici bilgisi gerçek zamanlı dinlenmeye devam eder; buna ek olarak açık sekmede periyodik, sekmeye dönüşte ve internet geri geldiğinde sunucu kontrolü vardır. Diğer yönetici giriş yaparsa **yalnızca son giriş yapan yönetici yetkili kalır**. Sunucu API ve Firestore kural kontrolleri kaldırılmadı.
+
+**Yayın:** `api/admin-session.js` dosyası, React istemcisi ve `server/admin-session.js` **aynı dağıtımda** yayımlanmalıdır. Önceki `firestore.rules` içindeki en son yönetici kontrolünü kaldırmayın; önceki paketteki gibi bu kuralların Firebase'de yayımlandığından emin olun. Yeni ortam değişkeni veya kullanıcı kodu/QR güncellemesi gerekmiyor.
+
+**PC üzerinde kontrol:** Son giriş yapan olarak PC'de yönetici paneline giriş yapın; en az 2 dakika açık bırakın, sayfayı yenileyin ve kullanıcı listesini açın. Telefon zaten yönetici panelindeyse PC girişi telefondaki eski oturumun yetkisini iptal etmelidir; telefon daha sonra yeniden giriş yaparsa PC oturumunun kapanması **istenen tek-yönetici kuralıdır**. PC'de açılır açılmaz tekrar giriş ekranına dönme yaşanırsa Vercel logları ve tarayıcı geliştirici konsolunda `/api/admin-session` dönüş kodunu kontrol edin. Bir hatada kullanıcı kodlarını, PIN'leri veya Firebase private key'i paylaşmayın.
+
+**Yerel doğrulama:** Node birim testleri 69/69 başarılıdır. Bu ortamda native Vite derlemesi Windows tabanlı eski `node_modules` nedeniyle doğrulanamıyor. Canlı ortam testi ve Firebase güvenlik kuralı yayını ayrıca yapılmalıdır.
+
+---
+
 # Sarıçam Gençlik Merkezi – 13.10.2026 düzenleme notları
 
 **Durum:** Kod hazırlığı ve yerel birim/ekran testleri tamamlandı. Canlı Firebase / Vercel yayını **yapılmadı**. Bu paket otomatik olarak canlı sistemi değiştirmez.

@@ -1,3 +1,5 @@
+> **13.10.2026 yönetici PC oturumu düzeltmesi (2026.10.13.2):** Firestore önbellek/geçici izin hatası artık yönetici panelini yanlışlıkla kapatmaz. Son aktif yönetici yetkisi sunucu ile doğrulanır. Yeni `api/admin-session.js` endpoint'ini aynı yayında dağıtın. Ayrıntılar `YAYIN_ONCESI_KONTROL.md` dosyasında.
+
 # Sarıçam Gençlik Merkezi Kütüphane Masa Takip Sistemi
 
 Sürüm: **2026.10.13.1**. Öğrenci GM Özel Kod ve şifreyle giriş yapar; masa seçimi/QR doğrulama, mola, boş masa ihbarı ve dilek/şikayet kullanılır. Yönetici kullanıcıları, masaları, kayıt/onayları, krokileri, ayarları, ihlalleri ve logları yönetir. Tutanak arayüzü ve belge üretimi kaldırılmıştır; ceza kuralları ve loglar korunmuştur.
