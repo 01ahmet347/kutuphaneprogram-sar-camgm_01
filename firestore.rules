@@ -1,41 +1,51 @@
 rules_version = '2';
+
 service cloud.firestore {
   match /databases/{database}/documents {
-    function signedIn() { return request.auth != null; }
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isAdminFor(appId) {
+      return signedIn()
+        && request.auth.token.admin == true
+        && request.auth.token.adminSessionId is string
+        && exists(/databases/$(database)/documents/artifacts/$(appId)/public/data/sgmAdminSessions/active)
+        && get(/databases/$(database)/documents/artifacts/$(appId)/public/data/sgmAdminSessions/active).data.sessionId == request.auth.token.adminSessionId;
+    }
+
     function isStudent(userId) {
-      return signedIn() && request.auth.token.role == 'student' && request.auth.uid == userId;
+      return signedIn()
+        && request.auth.token.role == 'student'
+        && request.auth.uid == userId;
     }
-    function hasAdminClaim() { return signedIn() && request.auth.token.admin == true; }
-    function isActiveAdmin(appId) {
-      return hasAdminClaim() && request.auth.token.adminSessionId is string &&
-        exists(/databases/$(database)/documents/artifacts/$(appId)/public/data/sgmAdminSessions/current) &&
-        get(/databases/$(database)/documents/artifacts/$(appId)/public/data/sgmAdminSessions/current).data.sessionId == request.auth.token.adminSessionId;
-    }
-    match /artifacts/{appId}/public/data/sgmAdminSessions/{documentId} {
-      allow get: if hasAdminClaim(); // Eski yönetici yeni oturum bilgisini okuyup çıkış yapabilir.
-      allow list, create, update, delete: if false; // Yalnızca Admin SDK.
-    }
+
     match /artifacts/{appId}/public/data/sgmConfig/{documentId} {
       allow read: if signedIn();
-      allow write: if isActiveAdmin(appId);
+      allow write: if isAdminFor(appId);
     }
-    match /artifacts/{appId}/public/data/sgmDesks/{documentId} {
+
+    match /artifacts/{appId}/public/data/sgmDesks/{deskId} {
       allow read: if signedIn();
-      allow write: if isActiveAdmin(appId);
+      allow write: if isAdminFor(appId);
     }
-    match /artifacts/{appId}/public/data/sgmUsers/{documentId} {
-      allow get: if isActiveAdmin(appId) || isStudent(documentId);
-      allow list: if isActiveAdmin(appId);
-      allow write: if isActiveAdmin(appId);
+
+    match /artifacts/{appId}/public/data/sgmUsers/{userId} {
+      allow get: if isAdminFor(appId) || isStudent(userId);
+      allow list: if isAdminFor(appId);
+      allow write: if isAdminFor(appId);
     }
-    match /artifacts/{appId}/public/data/sgmMessages/{documentId} {
-      allow get: if isActiveAdmin(appId) || isStudent(documentId);
-      allow list: if isActiveAdmin(appId);
-      allow write: if isActiveAdmin(appId);
+
+    match /artifacts/{appId}/public/data/sgmMessages/{userId} {
+      allow get: if isAdminFor(appId) || isStudent(userId);
+      allow list: if isAdminFor(appId);
+      allow write: if isAdminFor(appId);
     }
+
     match /artifacts/{appId}/public/data/{collection}/{documentId} {
-      allow read, write: if isActiveAdmin(appId);
+      allow read, write: if isAdminFor(appId);
     }
+
     match /{document=**} {
       allow read, write: if false;
     }

@@ -12,28 +12,37 @@ export function createStudentLoginHandler({ findBySpecialCode, createCustomToken
       res.setHeader('Allow', 'POST');
       return res.status(405).json({ ok: false });
     }
+
     const { specialCode, pin } = req.body || {};
     if (typeof specialCode !== 'string' || !/^\d{8}$/.test(specialCode) ||
         typeof pin !== 'string' || !/^\d{8}$/.test(pin)) {
       return res.status(400).json({ ok: false, error: 'invalid_credentials' });
     }
+
     try {
       if (await isRateLimited?.(req, specialCode)) {
         return res.status(429).json({ ok: false, error: 'too_many_attempts', message: 'Çok fazla giriş denemesi yapıldı. Bir süre sonra tekrar deneyin.' });
       }
       const matches = await findBySpecialCode(specialCode);
-      const valid = matches.length === 1 && equalSecret(pin, matches[0].user.pin) && !matches[0].deleted;
+      const valid = matches.length === 1 &&
+        equalSecret(pin, matches[0].user.pin) &&
+        !matches[0].deleted;
       if (!valid) return res.status(401).json({ ok: false, error: 'invalid_credentials' });
+
       const { id, user } = matches[0];
-      // Kullanıcı oturumunun açılması sayaç temizleme servisine bağlı değildir.
-      const token = await createCustomToken(id, { role: 'student' });
+      // Başarılı giriş, sayaç silme problemi nedeniyle reddedilemez.
       try { await clearAttempts?.(req, specialCode); }
-      catch (error) { console.warn('Login attempt reset failed:', error.code || 'unknown'); }
+      catch (error) { console.warn('Login attempt cleanup deferred:', error?.code || 'unavailable'); }
+      const token = await createCustomToken(id, { role: 'student' });
       const { pin: _pin, pushTokens: _pushTokens, ...profile } = user;
       return res.status(200).json({ ok: true, token, user: { ...profile, id } });
     } catch (error) {
       console.error('Student login error:', error.code || 'unknown');
-      return res.status(503).json({ ok: false, error: 'student_auth_unavailable', message: 'Öğrenci girişi şu anda kullanılamıyor. Firebase sunucu ayarlarını kontrol edin.' });
+      return res.status(503).json({
+        ok: false,
+        error: 'student_auth_unavailable',
+        message: 'Öğrenci girişi şu anda kullanılamıyor. Firebase sunucu ayarlarını kontrol edin.'
+      });
     }
   };
 }

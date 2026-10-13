@@ -3,24 +3,29 @@ import { getAuth } from 'firebase-admin/auth';
 import { adminApp, dataCollection } from '../server/firebase-admin.js';
 import { createStudentLoginHandler } from '../server/student-auth.js';
 
-// Aynı Wi-Fi'daki farklı öğrencilerin birbirinin sayacını tüketmesini önle.
 const attemptRef = (req, specialCode) => {
   const clientAddress = req.headers?.['x-vercel-forwarded-for'] ||
     req.headers?.['x-forwarded-for']?.split(',')[0]?.trim() ||
-    req.socket?.remoteAddress || 'unknown';
-  const key = createHash('sha256').update(`${String(clientAddress)}:${String(specialCode)}`).digest('hex');
+    req.socket?.remoteAddress ||
+    'unknown';
+  const key = createHash('sha256').update(`${String(clientAddress)}:${String(specialCode || '')}`).digest('hex');
   return dataCollection('sgmAuthAttempts').doc(key);
 };
 
 const handler = createStudentLoginHandler({
   async findBySpecialCode(specialCode) {
-    const matches = await dataCollection('sgmUsers').where('specialCode', '==', specialCode).limit(2).get();
+    const matches = await dataCollection('sgmUsers')
+      .where('specialCode', '==', specialCode)
+      .limit(2)
+      .get();
     return Promise.all(matches.docs.map(async snapshot => {
       const deleted = await dataCollection('sgmDeletedUsers').doc(snapshot.id).get();
       return { id: snapshot.id, user: snapshot.data(), deleted: deleted.exists };
     }));
   },
-  createCustomToken(uid, claims) { return getAuth(adminApp()).createCustomToken(uid, claims); },
+  createCustomToken(uid, claims) {
+    return getAuth(adminApp()).createCustomToken(uid, claims);
+  },
   async isRateLimited(req, specialCode) {
     const ref = attemptRef(req, specialCode);
     const at = Date.now();
@@ -33,7 +38,9 @@ const handler = createStudentLoginHandler({
       return attempts > 8;
     });
   },
-  async clearAttempts(req, specialCode) { await attemptRef(req, specialCode).delete(); }
+  async clearAttempts(req, specialCode) {
+    await attemptRef(req, specialCode).delete();
+  }
 });
 
 export default handler;

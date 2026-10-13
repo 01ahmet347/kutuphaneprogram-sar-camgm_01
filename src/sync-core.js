@@ -48,7 +48,7 @@ export function releaseUserFromDesk(desk, userId) {
     reportEndTime: null, reportIssuedAt: null, reportVerifiedAt: null
   });
   if (String(desk.pendingOccupant || '') === id) Object.assign(next, {
-    pendingOccupant: null, pendingDeskRole: null, pendingDeskDeadline: null
+    pendingOccupant: null, pendingDeskRole: null, pendingDeskDeadline: null, pendingDeviceId: null
   });
   if (String(desk.guestOccupant || '') === id) Object.assign(next, {
     guestOccupant: null, guestSessionStartTime: null, guestBreakEndTime: null,

@@ -1148,33 +1148,15 @@ function MainApp() {
 
   const [currentUser, setCurrentUser] = useState(null);
   const [now, setNow] = useState(Date.now());
-  const serverClockOffsetRef = useRef(0);
-  useEffect(() => {
-    let cancelled = false;
-    const sync = async () => {
-      try {
-        const start = Date.now();
-        const response = await fetch('/api/server-time', { cache: 'no-store' });
-        const payload = await response.json();
-        const end = Date.now();
-        if (!response.ok || !Number.isFinite(Number(payload?.now)) || cancelled) return;
-        serverClockOffsetRef.current = Number(payload.now) - (start + end) / 2;
-        setNow(Date.now() + serverClockOffsetRef.current);
-      } catch (_) { /* Son başarılı saat sapması korunur; sunucu işlemleri yine doğrular. */ }
-    };
-    sync();
-    window.addEventListener('online', sync);
-    window.addEventListener('focus', sync);
-    const timer = setInterval(sync, 10 * 60 * 1000);
-    return () => { cancelled = true; clearInterval(timer); window.removeEventListener('online', sync); window.removeEventListener('focus', sync); };
-  }, []);
   const sessionRestoredRef = useRef(false);
   const missingSessionUserSinceRef = useRef(0);
   useEffect(() => {
     if (!isDataLoaded || sessionRestoredRef.current) return;
-    sessionRestoredRef.current = true;
     try {
       const saved = JSON.parse(sessionStorage.getItem('sgm_student_session') || 'null');
+      if (saved?.userId && db && !users.some(u => u.id === saved.userId) &&
+          !serverDeletedUserIdsRef.current.has(String(saved.userId))) return;
+      sessionRestoredRef.current = true;
       const user = (Array.isArray(users) ? users : []).find(u => u.id === saved?.userId);
       if (sessionCanRestore(saved, user)) {
         setCurrentUser(user);
@@ -1582,11 +1564,8 @@ function MainApp() {
 
   const checkLibraryOpen = () => {
       if (!settings.openTime || !settings.closeTime) return true;
-      const d = new Date(Date.now() + serverClockOffsetRef.current);
-      const parts = Object.fromEntries(new Intl.DateTimeFormat('en-GB', {
-        timeZone: 'Europe/Istanbul', hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
-      }).formatToParts(d).map(part => [part.type, Number(part.value)]));
-      const currentTimeMin = parts.hour * 60 + parts.minute;
+      const d = new Date();
+      const currentTimeMin = d.getHours() * 60 + d.getMinutes();
       const [openH, openM] = settings.openTime.split(':').map(Number);
       const openTimeMin = openH * 60 + openM;
       const [closeH, closeM] = settings.closeTime.split(':').map(Number);
@@ -1617,7 +1596,9 @@ function MainApp() {
       if (isReportedForMe && reportKey && lastReportNotifiedRef.current !== reportKey) {
         lastReportNotifiedRef.current = reportKey;
 
-        const safeReportWaitMinutes = 5;
+        const safeReportWaitMinutes = Number.isFinite(Number(settings.reportWaitTime)) && Number(settings.reportWaitTime) > 0
+          ? Number(settings.reportWaitTime)
+          : 5;
         const notificationText = `Masa ${currentMyDesk.id} numaralı ${isGuestSession ? 'misafir' : 'ana'} oturumunuz masada bulunmadığınız gerekçesiyle bildirildi. ${safeReportWaitMinutes} dakika içinde masaya dönüp QR kod ile doğrulama yapın.`;
 
         // Tarayıcı / işletim sistemi bildirimi
@@ -1945,28 +1926,6 @@ function MainApp() {
     return () => { disposed = true; clearTimeout(retryTimer); window.removeEventListener('online', resumeAuth); unsubscribe(); };
   }, []);
 
-  // Aktif yönetici oturumu sunucuda değiştiğinde eski sekmeyi anında yetkisiz yap.
-  useEffect(() => {
-    if (!db || !fbUser || !adminAuthorized) return;
-    let alive = true;
-    const un = onSnapshot(
-      doc(db, 'artifacts', appId, 'public', 'data', 'sgmAdminSessions', 'current'),
-      snap => {
-        fbUser.getIdTokenResult().then(result => {
-          if (!alive || !snap.exists() || auth?.currentUser?.uid !== fbUser.uid) return;
-          if (result.claims.admin !== true || result.claims.adminSessionId !== snap.data().sessionId) {
-            verifiedAdminUidRef.current = null;
-            setAdminAuthorized(false);
-            setView(previous => previous === 'admin_dash' ? 'admin_login' : previous);
-            signOut(auth).then(() => signInTabAnonymously()).catch(console.error);
-            showMessage('Yönetici Oturumu Sona Erdi', 'Başka bir yönetici giriş yaptı.', 'warning');
-          }
-        }).catch(() => {});
-      }, error => { console.warn('Yönetici oturum durumu alınamadı:', error?.code || 'unknown'); }
-    );
-    return () => { alive = false; un(); };
-  }, [fbUser, adminAuthorized]);
-
   // ============================================================
   // FIRESTORE KOTA DOSTU PARÇALI SENKRONİZASYON
   // ============================================================
@@ -2048,7 +2007,8 @@ function MainApp() {
     logs: false, violations: false, feedback: false
   });
   const granularWriteTimerRef = useRef(null);
-  const adminUserSaveInFlightRef = useRef(new Set());
+  const adminUserSaveInFlightRef = useRef(false);
+  const adminUserSaveQueueRef = useRef(Promise.resolve());
   const [adminUserSavingId, setAdminUserSavingId] = useState(null);
   const granularWriteChainRef = useRef(Promise.resolve());
   const quotaBackoffUntilRef = useRef(0);
@@ -2058,6 +2018,28 @@ function MainApp() {
   const [usersSyncError, setUsersSyncError] = useState('');
   const [adminUsersServerReady, setAdminUsersServerReady] = useState(false);
   const [cachedUsersDifference, setCachedUsersDifference] = useState(0);
+
+  // A new manager revokes the previous manager in both Rules and the open UI.
+  useEffect(() => {
+    if (!db || !adminAuthorized || fbUser?.uid !== 'sgm-admin') return;
+    let stopped = false;
+    let unsubscribe = () => {};
+    const replaced = () => {
+      if (stopped) return;
+      setAdminAuthorized(false);
+      setView(previous => previous === 'admin_dash' ? 'admin_login' : previous);
+      if (auth?.currentUser?.uid === 'sgm-admin') signOut(auth).catch(() => {});
+    };
+    fbUser.getIdTokenResult().then(token => {
+      if (stopped) return;
+      const sessionId = token.claims.adminSessionId;
+      if (!sessionId) return replaced();
+      unsubscribe = onSnapshot(getLiveDoc('sgmAdminSessions', 'active'),
+        snap => { if (!snap.exists() || snap.data().sessionId !== sessionId) replaced(); },
+        () => replaced());
+    }).catch(replaced);
+    return () => { stopped = true; unsubscribe(); };
+  }, [adminAuthorized, fbUser?.uid]);
 
   const stableJson = value => {
     try { return JSON.stringify(value); } catch { return ''; }
@@ -2333,9 +2315,10 @@ function MainApp() {
   };
 
   // Hesap düzenleme başarılı mesajı yalnızca sunucu işlemi tamamlanınca gösterilir.
-  const saveAdminUserChanges = async (original, desired) => {
-    if (adminUserSaveInFlightRef.current.has(String(original.id))) throw new Error('Bu kullanıcının kaydı hâlen devam ediyor.');
-    adminUserSaveInFlightRef.current.add(String(original.id));
+  const saveAdminUserChanges = (original, desired) => {
+    // Consecutive or bulk saves wait in a queue instead of failing spuriously.
+    const performSave = async () => {
+    adminUserSaveInFlightRef.current = true;
     setAdminUserSavingId(original.id);
     clearTimeout(granularWriteTimerRef.current);
     try {
@@ -2377,9 +2360,13 @@ function MainApp() {
       localStorage.setItem('sgm_users', JSON.stringify(usersRef.current));
       return result;
     } finally {
-      adminUserSaveInFlightRef.current.delete(String(original.id));
+      adminUserSaveInFlightRef.current = false;
       setAdminUserSavingId(null);
     }
+    };
+    const job = adminUserSaveQueueRef.current.then(performSave);
+    adminUserSaveQueueRef.current = job.catch(() => {});
+    return job;
   };
 
   const refreshStudentProfile = async () => {
@@ -3253,9 +3240,6 @@ function MainApp() {
   const saveAppendOutbox = () => {
     try { localStorage.setItem('sgm_append_outbox', JSON.stringify(readAppendOutbox())); } catch (error) { console.warn('Bekleyen kayıtlar saklanamadı:', error); }
   };
-  // Masa servisi geçerli ihbarı ve denetim kaydını aynı transaction'da oluşturur.
-  // İlgili eventId'yi tarayıcıdan tekrar yazmak bildirim kuyruğunu kilitleyebilir.
-  const isServerReportEventId = id => /^report-(?:[1-9]|[12]\d|3[0-5])-\d{13}-[a-z0-9]{1,7}$/.test(String(id || ''));
   const isStudentAuditType = type => [
     'SISTEM_GIRIS', 'PIL_AYARI_BILGILENDIRME', 'OGRENCI_', 'ÖĞRENCİ_', 'İHBAR', 'IHBAR', 'GERIBILDIRIM_ACILDI',
     'MASA_', 'MOLA_', 'BILDIRIM_IPTAL', 'KISITLI_ISLEM_ENGELLENDI',
@@ -3264,15 +3248,6 @@ function MainApp() {
   const bucketDeletionKey = bucket => ({ sgmAudit: 'logs', sgmLogs: 'logs', sgmViolations: 'violations', sgmFeedback: 'feedback' })[bucket];
   const persistAppendItem = async item => {
     if (!db || !fbUser || !navigator.onLine || Date.now() < quotaBackoffUntilRef.current) throw new Error('Kayıt cihazda bekliyor; bağlantı/kota düzeldiğinde gönderilecek.');
-    // Önceki sürümlerden kalan, sunucudaki ihbar transaction'ıyla ZATEN
-    // yazılmış aynı kimlikli olayı öğrenci uç noktasına tekrar gönderme.
-    if (item.bucket === 'sgmAudit' && item.record?.type === 'İHBAR' &&
-        String(item.record?.id) === String(item.documentId) &&
-        isServerReportEventId(item.documentId)) {
-      const key = `sgmAudit/${item.documentId}`;
-      if (readAppendOutbox()[key]) { delete readAppendOutbox()[key]; saveAppendOutbox(); }
-      return;
-    }
     if (!adminAuthorized) {
       if (item.delete) throw new Error('Öğrenci oturumu geçmiş kayıtları silemez.');
       if (item.bucket === 'sgmFeedback') {
@@ -3431,9 +3406,7 @@ function MainApp() {
     setLogs(nextLogs);
     try { localStorage.setItem('sgm_logs', JSON.stringify(nextLogs)); } catch {}
     const studentEvent = isStudentAuditType(type);
-    const alreadyRecordedByDeskServer = db && type === 'İHBAR' &&
-      isServerReportEventId(extraData?.eventId) && newLog.id === extraData.eventId;
-    if ((adminAuthorized || studentEvent) && !alreadyRecordedByDeskServer) archiveLog(newLog);
+    if (adminAuthorized || studentEvent) archiveLog(newLog);
     if (type === 'ADMIN_MASA_MESAJI' && userId) queueAppend('sgmMessages', newLog, { documentId: userId, replace: true });
     // One canonical event document. Students never listen to the global archive.
 
@@ -3735,7 +3708,7 @@ function MainApp() {
   const closeMessage = () => setModal(prev => ({ ...prev, isOpen: false }));
 
   const settleCloudExpiry = async deskId => {
-    if (expiredDeskJobsRef.current.has(deskId) || !fbUser || !navigator.onLine || Date.now() < quotaBackoffUntilRef.current) return;
+    if (expiredDeskJobsRef.current.has(deskId) || !fbUser || !navigator.onLine || Date.now() < quotaBackoffUntilRef.current || !checkLibraryOpen()) return;
     expiredDeskJobsRef.current.add(deskId);
     try {
       const result = adminAuthorized
@@ -3743,7 +3716,7 @@ function MainApp() {
         : await runStudentDeskAction('expire', { deskId });
       if (!result) return;
       applyCloudRows(result);
-      if (result.verified) return;
+      if (result.verified || result.mode === 'closing_grace') return;
       const userId = result.user?.id;
       if (result.mode === 'reservation') {
         addLog('MASA_REZERVASYON_SURE_DOLDU', `Masa ${deskId} için 5 dakikalık QR rezervasyonu sona erdi.`, deskId, userId, false, null, { eventId: result.eventId });
@@ -3763,13 +3736,12 @@ function MainApp() {
     const timer = setInterval(() => {
       if (auth && !isDataLoaded) return; // EKLENDİ: Veritabanı bağlıysa veri yüklenene kadar boş lokal verinin sistemi ezmesini engelle
       
-      const currentTime = Date.now() + serverClockOffsetRef.current;
+      const currentTime = Date.now();
       setNow(currentTime);
 
-      const d = new Date(currentTime);
-      const currentHourMin = d.toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Istanbul' });
-      const trParts = Object.fromEntries(new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/Istanbul', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(d).map(p => [p.type, Number(p.value)]));
-      const currentTimeMin = trParts.hour * 60 + trParts.minute;
+      const d = new Date();
+      const currentHourMin = d.toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' });
+      const currentTimeMin = d.getHours() * 60 + d.getMinutes();
       const todayStr = d.toLocaleDateString('tr-TR');
       const todayKey = getLocalDayKey(d);
       const [closeH, closeM] = (settings.closeTime || '22:00').split(':').map(Number);
@@ -3801,7 +3773,7 @@ function MainApp() {
          addLog('SİSTEM_OTOMATİK', 'Yeni gün başlangıcı: Tüm mola ve ihlal hakları sıfırlandı.');
       }
 
-      if ((!db) && settings.closeTime && !checkLibraryOpen() && currentTimeMin >= closeTimeMin && localStorage.getItem('sgm_last_close') !== todayStr) {
+      if ((!db || adminAuthorized) && settings.closeTime && !checkLibraryOpen() && currentTimeMin >= closeTimeMin && localStorage.getItem('sgm_last_close') !== todayStr) {
          // 22:00 kapanışında sadece bildirim/log değil, masa + kullanıcı + localStorage + Firestore
          // aynı işlem içinde temizlenir. İşaret, temizlik başlatıldıktan sonra yazılır.
          runFullDayCleanup({
@@ -3846,7 +3818,7 @@ function MainApp() {
       const safetyMarkerKey = `sgm_last_dynamic_safety_check_v3_${safetyTimeKey}`;
 
       if (
-        (!db) && safetyWindowReached &&
+        (!db || adminAuthorized) && safetyWindowReached &&
         localStorage.getItem(safetyMarkerKey) !== todayStr
       ) {
          const desksAtSafety = Array.isArray(desksRef.current) ? desksRef.current : [];
@@ -3983,9 +3955,12 @@ function MainApp() {
 
 
       // Döngü içi state çakışmasını engellemek için mevcut değerleri Ref'ten okuyoruz
-      const restrictedIds = new Set((usersRef.current || []).filter(u => u.blocked || isRestricted(u, currentTime)).map(u => u.id));
+      const restrictedIds = new Set((usersRef.current || []).filter(u => (u.blocked || isRestricted(u, currentTime)) &&
+        !(u.activeDeskId && Number(u.adminDeskOverrideDeskId) === Number(u.activeDeskId) &&
+          (desksRef.current || []).some(d => Number(d.id) === Number(u.activeDeskId) &&
+            Number(d.sessionStartTime) === Number(u.adminDeskOverrideSessionStart) && d.occupant === u.id))).map(u => u.id));
       const restrictedDeskIds = new Set((desksRef.current || []).filter(d => restrictedIds.has(d.occupant) || restrictedIds.has(d.pendingOccupant)).map(d => d.id));
-      if ((!db) && restrictedDeskIds.size) {
+      if ((!db || adminAuthorized) && restrictedDeskIds.size) {
         (desksRef.current || []).filter(desk => restrictedDeskIds.has(desk.id)).forEach(desk => {
           const userId = desk.occupant || desk.pendingOccupant;
           addLog('HESAP_KISITI_MASA_BOSALTILDI', `Masa ${desk.id}, kullanıcı hesabının kısıtlanması nedeniyle boşaltıldı.`, desk.id, userId, false, null,
@@ -4002,11 +3977,11 @@ function MainApp() {
       const expiredDeskReservations = [];
 
       const newDesks = currentDesks.map(desk => {
-        if (db && (
+        if (db && fbUser && (
           desk.pendingOccupant && Number(desk.pendingDeskDeadline) > 0 && currentTime >= Number(desk.pendingDeskDeadline) ||
           desk.status === 'reported' && Number(desk.reportEndTime) > 0 && currentTime >= Number(desk.reportEndTime)
         )) {
-          if (fbUser) settleCloudExpiry(desk.id);
+          settleCloudExpiry(desk.id);
           return desk;
         }
 
@@ -4017,11 +3992,59 @@ function MainApp() {
           return { ...desk, pendingOccupant: null, pendingDeskRole: null, pendingDeskDeadline: null };
         }
 
-        // Mola bitişi ceza değildir. İhbar süresi dolsa bile sunucu teyidi
-        // olmadan istemcide ihlal veya masa boşaltma yapılmaz.
-        if (desk.status === 'on_break' || desk.status === 'reported') return desk;
+        // Mola süresinin dolması ihlal değildir; geçerli ihbar beklenir.
+        if (desk.status === 'reported' && desk.reportEndTime && currentTime >= desk.reportEndTime) {
+          desksChanged = true;
 
-        // Eski misafir alanları okunur; ceza yalnızca doğrulanmış sunucu ihbarından üretilebilir.
+          // QR ile doğrulanan aynı ihbar, gecikmiş bir state/Firestore snapshot'ı yüzünden
+          // tekrar "reported" görünse bile ihlal üretmesin.
+          const reportWasAlreadyVerified = !!(
+            desk.reportIssuedAt &&
+            desk.reportVerifiedAt &&
+            Number(desk.reportVerifiedAt) >= Number(desk.reportIssuedAt)
+          );
+
+          if (reportWasAlreadyVerified) {
+            return { ...desk, status: 'occupied', reportEndTime: null, reportIssuedAt: null };
+          }
+
+          const deskUser = (Array.isArray(usersRef.current) ? usersRef.current : []).find(u => u.id === desk.occupant);
+          const currentStrikes = Number.isFinite(Number(deskUser?.strikes)) ? Number(deskUser.strikes) : 0;
+          const strikeLimit = 1; // İlk ihlalde masa otomatik boşaltılır
+          const newStrikes = currentStrikes + 1;
+          const shouldReleaseDesk = true; // İlk ihlalde masa boşaltılır.
+
+          usersToUpdate.push({ id: desk.occupant, type: 'report_timeout', deskId: desk.id, newStrikes, shouldReleaseDesk });
+
+          return shouldReleaseDesk
+            ? { ...desk, status: 'available', occupant: null, ownerDeviceId: null, guestOccupant: null, pendingOccupant: null, pendingDeskDeadline: null, breakEndTime: null, reportEndTime: null, reportIssuedAt: null, sessionStartTime: null }
+            : { ...desk, status: 'occupied', reportEndTime: null, reportIssuedAt: null };
+        }
+
+        // Misafir molasında da sırf süre dolduğu için ihlal oluşturulmaz.
+
+        // Misafir ihbar doğrulama süresi dolduysa ihlal yalnızca misafire uygulanır.
+        if (desk.guestOccupant && desk.guestReported && desk.guestReportEndTime && currentTime >= desk.guestReportEndTime) {
+          desksChanged = true;
+
+          const guestReportWasAlreadyVerified = !!(
+            desk.guestReportIssuedAt &&
+            desk.guestReportVerifiedAt &&
+            Number(desk.guestReportVerifiedAt) >= Number(desk.guestReportIssuedAt)
+          );
+
+          if (guestReportWasAlreadyVerified) {
+            return { ...desk, guestReported: false, guestReportEndTime: null, guestReportIssuedAt: null };
+          }
+
+          const guestUser = (Array.isArray(usersRef.current) ? usersRef.current : []).find(u => u.id === desk.guestOccupant);
+          const currentStrikes = Number.isFinite(Number(guestUser?.strikes)) ? Number(guestUser.strikes) : 0;
+          const newStrikes = currentStrikes + 1;
+          const shouldReleaseDesk = newStrikes >= 2;
+          usersToUpdate.push({ id: desk.guestOccupant, type: 'guest_report_timeout', deskId: desk.id, newStrikes, shouldReleaseDesk, isGuest: true });
+          return { ...desk, guestReported: false, guestReportEndTime: null, guestReportIssuedAt: null, ...(shouldReleaseDesk ? { guestOccupant: null, guestSessionStartTime: null, guestBreakEndTime: null } : {}) };
+        }
+
         return desk;
       });
 
@@ -4195,10 +4218,10 @@ function MainApp() {
       showMessage('Hesabınız Kısıtlı', 'Kısıtlı hesaplar masa seçemez, boş masa ihbarı ve dilek / şikayet gönderemez. Gerekli kontroller için kütüphane sorumlusu ile iletişime geçin.', 'warning');
       return null;
     }
-    if (deskClaim && Number(user.deskReleasedId || 0) === Number(deskId) && deskWaitRemaining(user) > 0) {
+    if (deskClaim && Number(user.deskReclaimDeskId || 0) === Number(deskId) && deskWaitRemaining(user) > 0) {
       setScannerConfig({ isOpen: false, mode: null, title: '' });
       addLog('MASA_BEKLEME_ENGELLENDI', `${action} işlemi 30 dakikalık bekleme süresi nedeniyle engellendi.`, null, user.id);
-      showMessage('Masa Alma Bekleme Süresi', `Yalnızca bıraktığınız masaya dönmek için bekleme süreniz devam ediyor. Kalan süre: ${formatTime(deskWaitRemaining(user))}. Sistem hatası yaşadıysanız yönetici masa atayabilir.`, 'warning');
+      showMessage('Masa Alma Bekleme Süresi', `Bıraktığınız masayı 30 dakika beklemelisiniz. Başka uygun masayı seçebilirsiniz. Kalan süre: ${formatTime(deskWaitRemaining(user))}. Sistem hatası yaşadıysanız yönetici masa atayabilir.`, 'warning');
       return null;
     }
     return user;
@@ -4684,7 +4707,7 @@ function MainApp() {
 
 
   const claimDesk = async (qrData) => {
-    if (!requireStudentAction('QR ile masa alma', { deskClaim: true, deskId: Number(String(qrData || '').split('-')[1]) })) return;
+    if (!requireStudentAction('QR ile masa alma', { deskClaim: true })) return;
     // Yönetici panelinden kısıt/onay kaldırılmışsa currentUser eski kalmış olabilir.
     // QR işleminde daima Firestore/users state'inden gelen EN GÜNCEL kullanıcıyı esas al.
     const latestClaimUser = (Array.isArray(usersRef.current) ? usersRef.current : [])
@@ -5197,7 +5220,7 @@ function MainApp() {
                         setTimeout(() => showMessage(
                           "Başarılı",
                           releaseMode === 'desk_empty'
-                            ? "Masanızı bıraktınız. 30 dakika sonra yeniden masa alabilirsiniz. Sistem hatasında yönetici masa atayabilir."
+                            ? "Masanızı bıraktınız. Yalnızca bu masayı 30 dakika sonra alabilirsiniz; başka boş masaları hemen seçebilirsiniz."
                             : "Masa oturumunuz sonlandırıldı. Sistem durumu senkronize edildi.",
                           "success"
                         ), 300);
@@ -5209,6 +5232,18 @@ function MainApp() {
   };
 
   const startBreak = async (type, confirmed = false) => {
+    if (!confirmed) {
+      setModal({ isOpen: true, type: 'info', title: 'Mola Onayı', content: (
+        <div className="space-y-4">
+          <p className="text-center font-semibold">Molaya çıkmak istiyor musunuz?</p>
+          <div className="grid grid-cols-2 gap-3">
+            <button type="button" className="p-3 bg-slate-200 rounded-xl font-bold" onClick={closeMessage}>Hayır</button>
+            <button type="button" className="p-3 bg-amber-500 rounded-xl font-bold" onClick={() => { closeMessage(); startBreak(type, true); }}>Evet</button>
+          </div>
+        </div>
+      ) });
+      return;
+    }
     if (!currentUser || !currentUser.activeDeskId) return;
     const safeUsers = Array.isArray(users) ? users : [];
     const myUser = safeUsers.find(u => u.id === currentUser.id);
@@ -5231,24 +5266,6 @@ function MainApp() {
           `${breakLabel} kullanabilmek için toplam ${requiredWorkMinutes} dakika aktif ders çalışmanız gerekiyor. Şu anda ${remainingMin} dakika daha çalışmalısınız.`,
           "warning"
         );
-    }
-
-    if (!confirmed) {
-      setModal({
-        isOpen: true,
-        type: 'warning',
-        title: 'Mola Onayı',
-        content: (
-          <div className="space-y-4">
-            <p className="font-semibold text-slate-800 text-center">Molaya çıkmak istiyor musunuz?</p>
-            <div className="flex gap-3">
-              <button type="button" onClick={closeMessage} className="flex-1 rounded-xl bg-slate-200 p-3 font-bold">Hayır</button>
-              <button type="button" onClick={() => { closeMessage(); startBreak(type, true); }} className="flex-1 rounded-xl bg-blue-600 p-3 font-bold text-white">Evet</button>
-            </div>
-          </div>
-        )
-      });
-      return;
     }
 
     const durationStr = type === 'short' ? settings.shortBreakDuration : settings.longBreakDuration;
@@ -5366,7 +5383,7 @@ function MainApp() {
     const safeDesks = Array.isArray(desks) ? desks : [];
     const desk = safeDesks.find(d => Number(d.id) === Number(deskId));
     if(!desk) return showMessage("Uyarı", "Masa bulunamadı.", "warning");
-    if (desk.status === 'on_break' && Number(desk.breakEndTime || 0) > Date.now()) return showMessage('Masa Molada', 'Resmî mola süresi henüz dolmadı.', 'info');
+    if (desk.status === 'on_break' && Number(desk.breakEndTime || 0) > Date.now()) return showMessage('Masa Molada', 'Resmî mola süresi bitmeden masa ihbar edilemez.', 'info');
     if(desk.status === 'disabled' || !desk.occupant) return showMessage("Uyarı", "Bu masada ihbar edilebilecek aktif kullanıcı bulunmuyor.", "warning");
     if(deskId === currentUser.activeDeskId) return showMessage("Uyarı", "Kendi bulunduğunuz masadaki kişileri ihbar edemezsiniz.", "warning");
 
@@ -5378,7 +5395,7 @@ function MainApp() {
     const openFormFor = (targetRole) => {
       const target = targetRole === 'guest' ? guest : owner;
       if (!target) return;
-      if (targetRole === 'owner' && desk.status === 'on_break' && Number(desk.breakEndTime || 0) > Date.now()) return showMessage("Bilgi", "Resmî mola süresi bitmeden ihbar edilemez.", "info");
+      if (targetRole === 'owner' && desk.status === 'on_break' && Number(desk.breakEndTime || 0) > Date.now()) return showMessage("Bilgi", "Ana kullanıcı resmi molada; mola bitmeden ihbar edilemez.", 'info');
       if (targetRole === 'guest' && desk.guestBreakEndTime && desk.guestBreakEndTime > Date.now()) return showMessage("Bilgi", "Misafir kullanıcı şu anda resmi mola durumunda; mola bitmeden ihbar edilemez.", "info");
       setReportFormContext({ deskId, targetRole, targetUserId: target.id });
       setModal({
@@ -5421,7 +5438,8 @@ function MainApp() {
     const reportedDesk = (desksRef.current || []).find(d => Number(d.id) === Number(deskId));
     const occupantId = targetRole === 'guest' ? reportedDesk?.guestOccupant : reportedDesk?.occupant;
     if (!reportedDesk || !occupantId || occupantId !== targetUserId || occupantId === freshReporter.id ||
-        reportedDesk.status === 'disabled' || (targetRole === 'owner' && (reportedDesk.status === 'reported' || (reportedDesk.status === 'on_break' && Number(reportedDesk.breakEndTime || 0) > Date.now()))) ||
+        reportedDesk.status === 'disabled' || (targetRole === 'owner' && (reportedDesk.status === 'reported' ||
+          (reportedDesk.status === 'on_break' && Number(reportedDesk.breakEndTime || 0) > Date.now()))) ||
         (targetRole === 'guest' && (reportedDesk.guestReported || Number(reportedDesk.guestBreakEndTime || 0) > Date.now()))) {
       return showMessage('İhbar Gönderilemedi', 'Masa durumu değişti veya bu kullanıcı için ihbar uygun değil.', 'warning');
     }
@@ -6016,21 +6034,33 @@ function MainApp() {
       pushUndoSnapshot(actionLabels[action] || 'Yönetici işlemi');
     }
     switch (action) {
-      case 'release': {
-        if (!window.confirm(`Masa ${deskId} yönetici tarafından boşaltılsın mı? Bu işlem öğrenciye ceza yazmaz.`)) break;
-        if (!db || !adminAuthorized) return showMessage('Yönetici Gerekli', 'Masa boşaltma için doğrulanmış yönetici oturumu ve bağlantı gerekir.', 'warning');
-        try {
-          const adminUser = auth?.currentUser;
-          const result = await cloudActions.adminRelease({ deskId, adminUid: adminUser?.uid || 'sgm-admin' });
-          applyCloudRows(result);
-          if (result?.users?.length) result.users.forEach(user => applyCloudRows({ user }));
-          showMessage('Masa Boşaltıldı', `Masa ${deskId} ceza uygulanmadan boşaltıldı. İşlem sunucuya kaydedildi.`, 'success');
-        } catch (error) {
-          handleFirestoreQuotaError(error);
-          showMessage('Masa Boşaltılamadı', error.message, 'warning');
+      case 'release':
+        if (!window.confirm(`Masa ${deskId} yönetici tarafından boşaltılsın mı? Bu işlem kayıt altına alınacak ve ihlal yazılmayacak.`)) return;
+        if (db) {
+          try {
+            await requireAdminForUserWrite();
+            const token = await auth.currentUser.getIdToken();
+            const response = await fetch('/api/admin-desk', { method: 'POST',
+              headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+              body: JSON.stringify({ action: 'release', deskId: Number(deskId) }) });
+            const result = await response.json().catch(() => null);
+            if (!response.ok || result?.ok !== true) throw new Error(result?.message || 'Masa boşaltılamadı.');
+            applyCloudRows({ desks: result.desks, user: result.user });
+            if (result.users?.length) {
+              const map = new Map(result.users.map(u => [u.id, u]));
+              usersRef.current = (usersRef.current || []).map(u => map.get(u.id) || u);
+              setUsers(usersRef.current);
+            }
+            // Sunucu işlemi idempotent bir audit kaydı üretir; ikinci log yazmayız.
+            showMessage('Masa Boşaltıldı', `Masa ${deskId} sunucuda boşaltıldı.`, 'success');
+          } catch (error) { handleFirestoreQuotaError(error); showMessage('Masa Boşaltılamadı', error.message, 'warning'); }
+          break;
         }
+        const releaseDeskData = (Array.isArray(desks) ? desks : []).find(d => d.id === deskId);
+        setDesks(prev => Array.isArray(prev) ? prev.map(d => d.id === deskId ? { ...d, status: 'available', occupant: null, guestOccupant: null, guestSessionStartTime: null, guestBreakEndTime: null, guestReported: false, guestReportEndTime: null, breakEndTime: null, reportEndTime: null, sessionStartTime: null } : d) : []);
+        setUsers(prev => Array.isArray(prev) ? prev.map(u => (u.id === userId || u.id === releaseDeskData?.guestOccupant) ? { ...u, activeDeskId: null, activeDeskRole: null } : u) : []);
+        addLog('ADMIN_MÜDAHALE', `Masa ${deskId} yönetici tarafından boşaltıldı.`, deskId, userId);
         break;
-      }
       case 'disable':
         const disabledDeskData = (Array.isArray(desks) ? desks : []).find(d => d.id === deskId);
         setDesks(prev => Array.isArray(prev) ? prev.map(d => d.id === deskId ? { ...d, status: 'disabled', occupant: null, guestOccupant: null, guestSessionStartTime: null, guestBreakEndTime: null, guestReported: false, guestReportEndTime: null } : d) : []);
@@ -6100,7 +6130,8 @@ function MainApp() {
       case 'assign_user': {
         const rows = usersRef.current || []; const deskRows = desksRef.current || [];
         const target = rows.find(u => u.id === userId); const targetDesk = deskRows.find(d => Number(d.id) === Number(deskId));
-        if (!target || target.blocked || target.pendingApproval) return showMessage('Atama Engellendi', 'Hesap bulunamadı, engelli veya henüz onaylanmadı. Önce hesabı onaylayın.', 'warning');
+        if (!checkLibraryOpen()) return showMessage('Atama Engellendi', 'Kütüphane kapalıyken masa ataması yapılamaz.', 'warning');
+        if (!target || target.pendingApproval) return showMessage('Atama Engellendi', 'Yeni kullanıcıyı önce onaylayın.', 'warning');
         if (!targetDesk || targetDesk.status !== 'available' || targetDesk.occupant ||
             (targetDesk.pendingOccupant && Number(targetDesk.pendingDeskDeadline) > nowTime && targetDesk.pendingOccupant !== userId)) {
           return showMessage('Atama Engellendi', 'Masa boş ve kullanıma açık olmalıdır.', 'warning');
@@ -6113,7 +6144,14 @@ function MainApp() {
         if (db) {
           try {
             if (!adminAuthorized) throw new Error('Yönetici yetkisi gerekli.');
-            const result = await cloudActions.assign({ userId, deskId });
+            await requireAdminForUserWrite();
+            const token = await auth.currentUser.getIdToken();
+            const response = await fetch('/api/admin-desk', {
+              method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+              body: JSON.stringify({ action: 'assign', userId, deskId: Number(deskId) })
+            });
+            const result = await response.json().catch(() => null);
+            if (!response.ok || result?.ok !== true) throw new Error(result?.message || 'Masa ataması sunucuda tamamlanamadı.');
             applyCloudRows(result);
             addLog('ADMIN_MASA_ATAMA', `Masa ${deskId} yönetici tarafından atandı.${waited ? ' 30 dakikalık bekleme için yönetici istisnası uygulandı.' : ''}`, deskId, userId, false, null, { cooldownOverride: waited > 0 });
             break;
@@ -6121,11 +6159,12 @@ function MainApp() {
         }
         const nextDesks = deskRows.map(d => Number(d.id) === Number(deskId)
           ? { ...d, status: 'occupied', occupant: userId, ownerDeviceId: target.deviceId || null, sessionStartTime: nowTime,
-              pendingOccupant: null, pendingDeskRole: null, pendingDeskDeadline: null, breakEndTime: null, reportEndTime: null, reportIssuedAt: null, reportVerifiedAt: null }
+              pendingOccupant: null, pendingDeskRole: null, pendingDeskDeadline: null, pendingDeviceId: null, breakEndTime: null, reportEndTime: null, reportIssuedAt: null, reportVerifiedAt: null }
           : d.pendingOccupant === userId ? { ...d, pendingOccupant: null, pendingDeskRole: null, pendingDeskDeadline: null } : d);
         const nextUsers = rows.map(u => u.id === userId ? { ...u, activeDeskId: deskId, activeDeskRole: 'owner',
           pendingDeskId: null, pendingDeskDeadline: null, lastActiveTime: nowTime,
-          deskReclaimAllowedAt: 0, gmDeskAccessAt: Math.max(nowTime, Number(u.gmDeskAccessAt || 0) + 1) } : u);
+          adminDeskOverrideDeskId: Number(deskId), adminDeskOverrideSessionStart: nowTime,
+          gmDeskAccessAt: Math.max(nowTime, Number(u.gmDeskAccessAt || 0) + 1) } : u);
         criticalDeskMutationRef.current = true; desksRef.current = nextDesks; usersRef.current = nextUsers;
         setDesks(nextDesks); setUsers(nextUsers);
         if (currentUser?.id === userId) { setCurrentUser(nextUsers.find(u => u.id === userId)); setSelectedDeskId(null); setDeskSelectionDeadline(null); }
@@ -6439,7 +6478,7 @@ function MainApp() {
                  <div className="flex gap-2">
                    <select id={`assign_user_${liveDesk.id}`} className="flex-1 p-2 rounded border border-blue-300 text-sm bg-white">
                       <option value="">Öğrenci Seçin...</option>
-                      {safeUsers.filter(u => !u.activeDeskId && !u.blocked && !u.pendingApproval).map(u => (
+                      {safeUsers.filter(u => !u.activeDeskId && !u.pendingApproval).map(u => (
                          <option key={u.id} value={u.id}>{u.name} • GM Özel Kod: {u.specialCode}{deskWaitRemaining(u) > 0 ? " • 30 dk bekleme: yönetici atayabilir" : ""}</option>
                       ))}
                    </select>
@@ -6483,7 +6522,9 @@ function MainApp() {
   const safeDesksList = Array.isArray(desks) ? desks : [];
   
   const myDesk = myUserObj && myUserObj.activeDeskId ? safeDesksList.find(d => d.id === myUserObj.activeDeskId) : null;
-  const studentRestricted = !myUserObj || myUserObj.blocked || isRestricted(myUserObj, now);
+  const studentRestricted = !myUserObj || ((myUserObj.blocked || isRestricted(myUserObj, now)) &&
+    !(myUserObj.activeDeskId && Number(myUserObj.adminDeskOverrideDeskId) === Number(myUserObj.activeDeskId) &&
+      Number(myDesk?.sessionStartTime) === Number(myUserObj.adminDeskOverrideSessionStart)));
   const studentDeskWait = deskWaitRemaining(myUserObj, now);
   const filteredUsers = safeUsersList.filter(u => !userSearch.trim() || [u.name, u.specialCode, u.pin].some(value => String(value || '').toLocaleLowerCase('tr-TR').includes(userSearch.trim().toLocaleLowerCase('tr-TR'))));
   const visibleLogs = [...new Map([...archivedLogs, ...(Array.isArray(logs) ? logs : [])].filter(l => !isRecordDeleted('logs', l.id) && !quietAuditEvents.has(l.type)).map(l => [l.id, l])).values()].sort((a,b) => b.time - a.time);
@@ -7733,7 +7774,7 @@ function MainApp() {
 
             <main className="flex-1 max-w-5xl mx-auto w-full p-4 lg:p-6 space-y-6">
               {studentRestricted && <div className="p-4 bg-amber-50 border border-amber-200 text-amber-900 rounded-2xl"><b>Hesabınız kısıtlı.</b> Masa seçimi, boş masa ihbarı ve dilek / şikayet kapalıdır. {myUserObj?.restrictionReason} Kütüphane sorumlusu gerekli kontrollerden sonra kısıtı kaldırabilir.<button onClick={refreshStudentProfile} className="block mt-2 px-3 py-2 bg-white border border-amber-300 rounded-lg font-bold">Hesap Durumunu Yenile</button></div>}
-              {!studentRestricted && studentDeskWait > 0 && <div className="p-4 bg-blue-50 border border-blue-200 text-blue-900 rounded-2xl"><b>Yeniden masa almak için kalan süre: {formatTime(studentDeskWait)}</b><p>Sistem hatası durumunda yönetici size masa atayabilir.</p></div>}
+              {!studentRestricted && studentDeskWait > 0 && <div className="p-4 bg-blue-50 border border-blue-200 text-blue-900 rounded-2xl"><b>Yalnızca Masa {myUserObj?.deskReclaimDeskId} için kalan bekleme: {formatTime(studentDeskWait)}</b><p>Diğer uygun masaları hemen seçebilirsiniz. Yönetici istisna uygulayabilir.</p></div>}
               {registrationResult && myUserObj?.pendingApproval && <div className="p-4 bg-white border rounded-2xl space-y-2"><p><b>GM özel kodunu yazmayı unutmayın:</b> {myUserObj.specialCode}</p><button disabled={registrationRedirectBusy} onClick={openRegistrationGoogleForm} className="p-3 bg-green-600 text-white rounded-xl">Kayıt formunu aç</button></div>}
               <div className="bg-white rounded-3xl shadow-sm border border-slate-200 overflow-hidden relative">
                 <div className={`h-2 w-full ${!myDesk ? 'bg-slate-300' : myIsOnBreak ? 'bg-yellow-400' : myIsReported ? 'bg-red-500' : 'bg-green-500'}`} />
@@ -7762,7 +7803,8 @@ function MainApp() {
                               <option value="">Masa seçiniz...</option>
                               {safeDesksList
                                 .filter(d => !(d.pendingOccupant && Number(d.pendingDeskDeadline || 0) > now))
-                                .filter(d => d.status === 'available' && !lostDeskToday(myUserObj, d.id) && !(studentDeskWait > 0 && Number(myUserObj?.deskReleasedId) === Number(d.id)))
+                                .filter(d => d.status === 'available' && !lostDeskToday(myUserObj, d.id) &&
+                                  !(studentDeskWait > 0 && Number(myUserObj?.deskReclaimDeskId) === Number(d.id)))
                                 .sort((a,b) => a.id - b.id)
                                 .map(d => (
                                   <option key={d.id} value={d.id}>
@@ -7789,7 +7831,7 @@ function MainApp() {
                           </div>
                           <p className="text-sm text-slate-600 text-left">Yalnızca <b>Masa {selectedDeskId}</b> üzerindeki QR kod kabul edilir. Farklı masa QR kodu okutulursa işlem yapılmaz.</p>
                           <div className="flex flex-col sm:flex-row gap-3">
-                            <button disabled={studentRestricted} onClick={() => setScannerConfig({ isOpen: true, mode: 'claim', title: `Masa ${selectedDeskId} QR Doğrulaması` })} className="flex-1 bg-blue-600 text-white px-5 py-4 rounded-xl hover:bg-blue-700 shadow-md flex items-center justify-center gap-2 font-bold">
+                            <button disabled={studentRestricted || (studentDeskWait > 0 && Number(selectedDeskId) === Number(myUserObj?.deskReclaimDeskId))} onClick={() => setScannerConfig({ isOpen: true, mode: 'claim', title: `Masa ${selectedDeskId} QR Doğrulaması` })} className="flex-1 bg-blue-600 text-white px-5 py-4 rounded-xl hover:bg-blue-700 shadow-md flex items-center justify-center gap-2 font-bold">
                               <QrCode className="w-5 h-5"/> Seçilen Masanın QR'ını Okut
                             </button>
                             <button type="button" disabled={deskCancellationBusy} onClick={() => cancelDeskSelection()} className="px-5 py-4 bg-slate-200 hover:bg-slate-300 disabled:opacity-50 text-slate-700 rounded-xl font-bold">{deskCancellationBusy ? 'İptal Ediliyor…' : 'Seçimi İptal Et'}</button>
@@ -7821,7 +7863,7 @@ function MainApp() {
                         {myIsOnBreak && (
                           <div className="mt-4 bg-yellow-50 border border-yellow-200 rounded-xl p-5 flex flex-col items-center">
                             <Coffee className="w-10 h-10 text-yellow-600 mb-2" />
-                            <p className="text-yellow-800 font-bold mb-1 text-center">{now >= myBreakEndTime ? 'Mola Süresi Doldu — QR ile Dönebilirsiniz' : 'Mola Devam Ediyor'}</p>
+                            <p className="text-yellow-800 font-bold mb-1 text-center">Mola Devam Ediyor</p>
                             <div className="text-4xl font-mono font-black text-yellow-700 my-3 tracking-widest">{formatTime(myBreakEndTime - now)}</div>
                             <button onClick={() => setScannerConfig({ isOpen: true, mode: 'return_break', title: 'Moladan Dönüş - Masa QR Doğrulaması' })} className="px-6 py-2 bg-yellow-200 hover:bg-yellow-300 text-yellow-800 font-bold rounded-full transition-colors flex items-center gap-2"><QrCode className="w-4 h-4" /> QR Okut ve Masaya Dön</button>
                           </div>

@@ -4,6 +4,8 @@ const STUDENT_EVENT_PREFIXES = [
   'OGRENCI_CIKIS',
   'OGRENCI_',
   'ÖĞRENCİ_',
+  'İHBAR',
+  'IHBAR',
   'GERIBILDIRIM_ACILDI',
   'MASA_',
   'MOLA_',
@@ -163,13 +165,9 @@ export function createStudentProfileWriters({ dataCollection, now = Date.now }) 
         }
         const user = userSnapshot.data();
         const pushTokens = [token, ...(Array.isArray(user.pushTokens) ? user.pushTokens.filter(value => value && value !== token) : [])].slice(0, 5);
-        // Aynı ve sağlıklı FCM kaydını her sayfa açılışında yeniden yazma.
-        if (user.pushEnabled === true && user.pushLastStage === '13_hazir' &&
-            !user.pushLastError && Array.isArray(user.pushTokens) &&
-            user.pushTokens.length === pushTokens.length &&
-            user.pushTokens.every((value, index) => value === pushTokens[index])) {
-          return { pushTokens, pushEnabled: true, pushUpdatedAt: user.pushUpdatedAt || at,
-            pushLastStage: '13_hazir', deduplicated: true };
+        if (Array.isArray(user.pushTokens) && user.pushTokens[0] === token &&
+            user.pushTokens.length === pushTokens.length && user.pushEnabled === true) {
+          return { pushTokens, pushEnabled: true, pushUpdatedAt: user.pushUpdatedAt, deduplicated: true };
         }
         tx.set(userRef, {
           pushTokens,

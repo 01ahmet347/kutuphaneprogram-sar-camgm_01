@@ -1,98 +1,73 @@
-// Sarıçam GM: 22.00 Türkiye saati sunucu kapanışı.
-// Sadece masa oturumları/rezervasyonlar sonlandırılır; hesap, PIN, QR veya ceza geçmişi silinmez.
+// Server-side, penalty-free 22:00 cleanup. QR codes and user credentials are untouched.
 import { dataCollection } from './firebase-admin.js';
+import { getIstanbulDayKey } from './student-desk.js';
 
-export function trDayKey(at = Date.now()) {
-  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'Europe/Istanbul', year: 'numeric', month: '2-digit', day: '2-digit'
-  }).formatToParts(new Date(at)).map(part => [part.type, part.value]));
-  return `${parts.year}-${parts.month}-${parts.day}`;
-}
-
-export function trMinuteOfDay(at = Date.now()) {
-  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-GB', {
+export function istanbulClock(at = Date.now()) {
+  const parts = new Intl.DateTimeFormat('en-GB', {
     timeZone: 'Europe/Istanbul', hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
-  }).formatToParts(new Date(at)).map(part => [part.type, Number(part.value)]));
-  return parts.hour * 60 + parts.minute;
+  }).formatToParts(new Date(at));
+  const time = Object.fromEntries(parts.map(part => [part.type, Number(part.value)]));
+  return { minute: time.hour * 60 + time.minute, dayKey: getIstanbulDayKey(new Date(at)) };
 }
 
-export const deskClearPatch = desk => ({
-  status: desk?.status === 'disabled' ? 'disabled' : 'available',
-  occupant: null, ownerDeviceId: null, sessionStartTime: null,
-  guestOccupant: null, guestSessionStartTime: null, guestBreakEndTime: null,
-  guestReported: false, guestReportEndTime: null,
-  guestReportIssuedAt: null, guestReportVerifiedAt: null,
-  pendingOccupant: null, pendingDeskRole: null, pendingDeskDeadline: null,
-  pendingDeviceId: null, breakEndTime: null, reportEndTime: null,
-  reportIssuedAt: null, reportVerifiedAt: null
-});
+export const afterClosing = at => istanbulClock(at).minute >= 22 * 60;
+export function outsideLibraryHours(at = Date.now(), openTime = '07:00') {
+  const parts = /^(\d{2}):(\d{2})$/.exec(String(openTime));
+  const opening = parts ? Number(parts[1]) * 60 + Number(parts[2]) : 7 * 60;
+  const minute = istanbulClock(at).minute;
+  return minute < opening || minute >= 22 * 60;
+}
 
-export async function closeAllDesksAt22({ at = Date.now(), collection = dataCollection } = {}) {
-  // Zamanlayıcı erken çalışırsa asla kapanış yapma.
-  if (trMinuteOfDay(at) < 22 * 60) return { skipped: 'before_22' };
-  const today = trDayKey(at);
-  const desksCollection = collection('sgmDesks');
-  const usersCollection = collection('sgmUsers');
-  const lockCollection = collection('sgmDeviceLocks');
-  const marker = collection('sgmDailyClosures').doc(today);
-  const db = desksCollection.firestore;
+export function closingDesk(desk) {
+  return {
+    ...desk,
+    status: desk.status === 'disabled' ? 'disabled' : 'available',
+    occupant: null, ownerDeviceId: null, sessionStartTime: null,
+    guestOccupant: null, guestSessionStartTime: null, guestBreakEndTime: null,
+    guestReported: false, guestReportEndTime: null, guestReportIssuedAt: null,
+    guestReportVerifiedAt: null,
+    pendingOccupant: null, pendingDeskRole: null, pendingDeskDeadline: null,
+    pendingDeviceId: null, breakEndTime: null, reportIssuedAt: null,
+    reportEndTime: null, reportVerifiedAt: null
+  };
+}
+export function closingUser(user) {
+  return {
+    ...user, activeDeskId: null, activeDeskRole: null,
+    pendingDeskId: null, pendingDeskDeadline: null,
+    adminDeskOverrideDeskId: null, adminDeskOverrideSessionStart: null
+  };
+}
 
-  // Tek transaction: ya masalar+kullanıcılar+kilitler birlikte temizlenir ya hiçbiri.
-  return db.runTransaction(async tx => {
-    const markerSnap = await tx.get(marker);
-    if (markerSnap.exists && markerSnap.data()?.complete) {
-      return { alreadyCompleted: true, date: today };
-    }
-    const dRefs = Array.from({ length: 35 }, (_, i) => desksCollection.doc(String(i + 1)));
-    const dSnaps = await Promise.all(dRefs.map(ref => tx.get(ref)));
-    const owners = new Map();
-    const locks = new Map();
-    for (const snap of dSnaps) {
-      if (!snap.exists) continue;
-      const d = snap.data();
-      const id = Number(snap.id);
-      for (const uid of [d.occupant, d.guestOccupant, d.pendingOccupant]) {
-        if (uid) {
-          if (!owners.has(String(uid))) owners.set(String(uid), new Set());
-          owners.get(String(uid)).add(id);
-        }
-      }
-      if (d.ownerDeviceId) locks.set(d.ownerDeviceId, id);
-      if (d.pendingDeviceId) locks.set(d.pendingDeviceId, id);
-    }
-    const uRefs = [...owners.keys()].map(uid => usersCollection.doc(uid));
-    const lRefs = [...locks.keys()].map(deviceId => lockCollection.doc(deviceId));
-    const [uSnaps, lSnaps] = await Promise.all([
-      Promise.all(uRefs.map(ref => tx.get(ref))),
-      Promise.all(lRefs.map(ref => tx.get(ref)))
+export async function closeLibraryDay({ at = Date.now(), collection = dataCollection } = {}) {
+  if (!afterClosing(at)) return { closed: false, reason: 'before_close' };
+  const day = istanbulClock(at).dayKey;
+  const desksCol = collection('sgmDesks');
+  const usersCol = collection('sgmUsers');
+  const marker = collection('sgmDailyClosures').doc(day);
+  return desksCol.firestore.runTransaction(async tx => {
+    // All reads happen before any writes, with transaction retries on concurrent updates.
+    const [previous, deskRows, userRows] = await Promise.all([
+      tx.get(marker), tx.get(desksCol), tx.get(usersCol)
     ]);
-    let released = 0;
-    for (const snap of dSnaps) {
-      if (!snap.exists) continue;
-      const before = snap.data();
-      if (before.occupant || before.guestOccupant || before.pendingOccupant ||
-          ['occupied', 'on_break', 'reported'].includes(before.status)) released++;
-      tx.set(snap.ref, deskClearPatch(before), { merge: true });
+    if (previous.exists) return { closed: false, reason: 'already_closed', day };
+    let deskCount = 0;
+    let userCount = 0;
+    for (const doc of deskRows.docs) {
+      const desk = doc.data();
+      const active = Boolean(desk.occupant || desk.pendingOccupant || desk.guestOccupant ||
+        desk.status === 'on_break' || desk.status === 'reported');
+      if (!active) continue;
+      tx.set(doc.ref, closingDesk(desk));
+      deskCount++;
     }
-    uSnaps.forEach((snap, index) => {
-      if (!snap.exists) return;
-      const user = snap.data();
-      const affected = owners.get(snap.id);
-      const patch = {};
-      if (affected.has(Number(user.activeDeskId))) {
-        Object.assign(patch, { activeDeskId: null, activeDeskRole: null, adminDeskGrant: null });
-      }
-      if (affected.has(Number(user.pendingDeskId))) {
-        Object.assign(patch, { pendingDeskId: null, pendingDeskDeadline: null });
-      }
-      if (Object.keys(patch).length) tx.set(uRefs[index], patch, { merge: true });
-    });
-    lSnaps.forEach((snap, index) => {
-      if (snap.exists && Number(snap.data()?.deskId) === locks.get(snap.id)) {
-        tx.delete(lRefs[index]);
-      }
-    });
-    tx.set(marker, { day: today, closedAt: at, complete: true, released });
-    return { date: today, released, completed: true };
+    for (const doc of userRows.docs) {
+      const user = doc.data();
+      if (!user.activeDeskId && !user.pendingDeskId && !user.adminDeskOverrideDeskId) continue;
+      tx.set(doc.ref, closingUser(user));
+      userCount++;
+    }
+    tx.create(marker, { day, closedAt: at, deskCount, userCount, penaltyFree: true });
+    return { closed: true, day, deskCount, userCount };
   });
 }

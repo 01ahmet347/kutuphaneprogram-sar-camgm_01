@@ -3,8 +3,22 @@ import { getFirestore } from 'firebase-admin/firestore';
 import { adminApp, dataCollection } from '../server/firebase-admin.js';
 import { createStudentDeskHandler, getIstanbulDayKey } from '../server/student-desk.js';
 import { createCloudActions } from '../src/cloud-transactions.js';
+import { outsideLibraryHours } from '../server/daily-close.js';
 
-export async function createServerDeskActions() {
+const handler = createStudentDeskHandler({
+  async authenticateStudent(req) {
+    const token = /^Bearer\s+(.+)$/i.exec(
+      req.headers?.authorization || ''
+    )?.[1];
+
+    if (!token) return null;
+
+    const decoded = await getAuth(adminApp()).verifyIdToken(token);
+
+    return decoded.role === 'student' ? decoded.uid : null;
+  },
+
+  async createActions() {
     const app = adminApp();
     const firestore = getFirestore(app);
 
@@ -87,6 +101,7 @@ export async function createServerDeskActions() {
 
     return {
       ...actions,
+      closedNow: () => outsideLibraryHours(Date.now(), settings.openTime || '07:00'),
 
       cancel: ({ userId, deskId }) =>
         firestore.runTransaction(async tx => {
@@ -138,21 +153,6 @@ export async function createServerDeskActions() {
         })
     };
   }
-
-const handler = createStudentDeskHandler({
-  async authenticateStudent(req) {
-    const token = /^Bearer\s+(.+)$/i.exec(
-      req.headers?.authorization || ''
-    )?.[1];
-
-    if (!token) return null;
-
-    const decoded = await getAuth(adminApp()).verifyIdToken(token);
-
-    return decoded.role === 'student' ? decoded.uid : null;
-  },
-
-  createActions: createServerDeskActions
 });
 
 export default handler;

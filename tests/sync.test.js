@@ -42,7 +42,7 @@ function memoryDatabase(seed = {}) {
 const user = id => ({id,name:id,blocked:false,pendingApproval:false,strikes:0,restrictedUntil:0,activeDeskId:null,pendingDeskId:null,pendingDeskDeadline:null,violationHistory:[]});
 const desk = id => ({id,status:'available',occupant:null,ownerDeviceId:null,pendingOccupant:null,pendingDeskDeadline:null,qrCode:`QR-${id}-test`});
 function actions(db,clock=()=>1000) {
-  return createCloudActions({db,runTransaction:db.runTransaction,ref:db.ref,settings:()=>({strikeLimit:2,breakCooldown:30,shortBreakCount:5,longBreakCount:2,shortBreakDuration:15,longBreakDuration:60,reportsEnabled:true,reportWaitTime:5,openTime:'00:00'}),dayKey:()=> '2026-10-07',
+  return createCloudActions({db,runTransaction:db.runTransaction,ref:db.ref,settings:()=>({strikeLimit:2,breakCooldown:30,shortBreakCount:5,longBreakCount:2,shortBreakDuration:15,longBreakDuration:60,reportsEnabled:true,reportWaitTime:5}),dayKey:()=> '2026-10-07',
     isRestricted:u=>u.pendingApproval||u.restrictedUntil>clock(),lostDeskToday:()=>false,now:clock,
     applyViolationPolicy:(u,id,at)=>({violationHistory:[...(u.violationHistory||[]),at],lostDeskIds:[id]})});
 }
@@ -114,37 +114,21 @@ test('daily student limits reset on the server before a new break is started',as
   assert.equal(db.data.get('sgmUsers/a').breaksResetDate,'2026-10-07');
   assert.equal(db.data.get('sgmUsers/a').violationsResetDate,'2026-10-07');
 });
-test('mola süresi dolsa da QR dönüşü cezasız mümkündür',async()=>{
+test('late QR return ends an expired break without a penalty when no report exists',async()=>{
   const db=memoryDatabase({
     'sgmUsers/a':{...user('a'),activeDeskId:1},
     'sgmDesks/1':{...desk(1),status:'on_break',occupant:'a',breakEndTime:900}
   });
-  const result = await actions(db).endBreak({userId:'a',deskId:1,qrCode:'QR-1-test'});
-  assert.equal(result.desk.status, 'occupied');
-  assert.equal(db.data.get('sgmUsers/a').strikes, 0);
+  await actions(db).endBreak({userId:'a',deskId:1,qrCode:'QR-1-test'});
+  assert.equal(db.data.get('sgmUsers/a').strikes,0);
+  assert.equal(db.data.get('sgmDesks/1').status,'occupied');
 });
-test('student report and presence verification are transactional and scoped to authenticated students',async(t)=>{
+test('student report and presence verification are transactional and scoped to authenticated students',async()=>{
   const db=memoryDatabase({
     'sgmUsers/reporter':{...user('reporter'),activeDeskId:2,canReport:true,name:'R'},
     'sgmUsers/target':{...user('target'),activeDeskId:1,name:'T',specialCode:'12345678'},
     'sgmDesks/1':{...desk(1),status:'occupied',occupant:'target'},
     'sgmDesks/2':{...desk(2),status:'occupied',occupant:'reporter'}
-  });
-  await t.test('late QR report verification cannot bypass an expired report penalty',async()=>{
-    const db=memoryDatabase({
-      'sgmUsers/a':{...user('a'),activeDeskId:1},
-      'sgmDesks/1':{...desk(1),status:'reported',occupant:'a',reportEndTime:900}
-    });
-    await assert.rejects(actions(db).verifyPresence({userId:'a',deskId:1,qrCode:'QR-1-test'}),/doğrulayabilirsiniz/);
-  });
-  await t.test('mola süresi dolduğunda ceza beklemeden masa bırakılabilir',async()=>{
-    const db=memoryDatabase({
-      'sgmUsers/a':{...user('a'),activeDeskId:1},
-      'sgmDesks/1':{...desk(1),status:'on_break',occupant:'a',breakEndTime:900}
-    });
-    const result = await actions(db).leaveDesk({userId:'a',deskId:1});
-    assert.equal(result.desk.status, 'available');
-    assert.equal(db.data.get('sgmUsers/a').strikes, 0);
   });
   const api=actions(db);
   const report=await api.reportDesk({userId:'reporter',deskId:1,targetUserId:'target'});
@@ -154,6 +138,20 @@ test('student report and presence verification are transactional and scoped to a
   await api.verifyPresence({userId:'target',deskId:1,qrCode:'QR-1-test'});
   assert.equal(db.data.get('sgmDesks/1').status,'occupied');
   assert.equal(db.data.get('sgmUsers/target').lastActiveTime,1000);
+});
+test('a report cannot be bypassed by late QR or leaving',async()=>{
+  const db=memoryDatabase({'sgmUsers/a':{...user('a'),activeDeskId:1},
+    'sgmDesks/1':{...desk(1),status:'reported',occupant:'a',reportEndTime:900}});
+  const api=actions(db);
+  await assert.rejects(api.verifyPresence({userId:'a',deskId:1,qrCode:'QR-1-test'}),/doğrulayabilirsiniz/);
+  await assert.rejects(api.leaveDesk({userId:'a',deskId:1}),/otomatik işlem/);
+});
+test('leaving after break expiry is voluntary and receives no violation',async()=>{
+  const db=memoryDatabase({'sgmUsers/a':{...user('a'),activeDeskId:1},
+    'sgmDesks/1':{...desk(1),status:'on_break',occupant:'a',breakEndTime:900}});
+  await actions(db).leaveDesk({userId:'a',deskId:1});
+  assert.equal(db.data.get('sgmUsers/a').strikes,0);
+  assert.equal(db.data.get('sgmUsers/a').deskReclaimDeskId,1);
 });
 test('student leave applies the server controlled cooldown',async()=>{
   const db=memoryDatabase({
@@ -176,11 +174,17 @@ test('administrator assignment racing a student reservation preserves one owner'
   assert.equal(result.filter(r=>r.status==='fulfilled').length,1);
   const d=db.data.get('sgmDesks/1');assert.equal(Boolean(d.occupant)&&Boolean(d.pendingOccupant),false);
 });
-test('two observers process one timeout and only one penalty',async()=>{
-  const db=memoryDatabase({'sgmUsers/a':{...user('a'),activeDeskId:1},'sgmDesks/1':{...desk(1),status:'reported',occupant:'a',reportIssuedAt:500,reportEndTime:900}}),api=actions(db);
-  const result=await Promise.all([api.expireDesk(1),api.expireDesk(1)]);
-  assert.equal(result.filter(Boolean).length,1);assert.equal(db.data.get('sgmUsers/a').strikes,1);
-  assert.equal(db.data.get('sgmUsers/a').violationHistory.length,1);assert.equal(db.data.get('sgmDesks/1').status,'available');
+test('break timeout never penalizes, report timeout is idempotent',async()=>{
+  const db=memoryDatabase({'sgmUsers/a':{...user('a'),activeDeskId:1},'sgmDesks/1':{...desk(1),status:'on_break',occupant:'a',breakEndTime:900}}),api=actions(db);
+  assert.equal(await api.expireDesk(1),null);
+  assert.equal(db.data.get('sgmUsers/a').strikes,0);
+  assert.equal(db.data.get('sgmDesks/1').status,'on_break');
+  db.data.set('sgmDesks/1',{...desk(1),status:'reported',occupant:'a',reportIssuedAt:500,reportEndTime:900});
+  const results=await Promise.all([api.expireDesk(1),api.expireDesk(1)]);
+  assert.equal(results.filter(Boolean).length,1);
+  assert.equal(db.data.get('sgmUsers/a').strikes,1);
+  assert.equal(db.data.get('sgmUsers/a').violationHistory.length,1);
+  assert.equal(db.data.get('sgmDesks/1').status,'available');
 });
 test('an already verified report does not produce a new penalty',async()=>{
   const db=memoryDatabase({'sgmUsers/a':{...user('a'),activeDeskId:1},'sgmDesks/1':{...desk(1),status:'reported',occupant:'a',reportIssuedAt:500,reportVerifiedAt:600,reportEndTime:900}}),api=actions(db);
@@ -245,4 +249,74 @@ test('personal message replay cannot replace a newer message',async()=>{
  const db=memoryDatabase({'sgmMessages/student':{id:'new',time:20,message:'Yeni'}}),ctx=applicationAppend(db);
  await ctx.persist({bucket:'sgmMessages',documentId:'student',record:{id:'old',time:10,message:'Eski'},replace:true});
  assert.equal(db.data.get('sgmMessages/student').id,'new');assert.equal(db.writes.length,0);
+});
+
+test('a voluntary 30-minute cooldown applies only to the last released desk', async () => {
+  const db = memoryDatabase({
+    'sgmUsers/a': { ...user('a'), deskReclaimDeskId: 12, deskReclaimAllowedAt: 1801000 },
+    'sgmDesks/12': desk(12), 'sgmDesks/8': desk(8)
+  });
+  const api = actions(db);
+  await assert.rejects(api.reserve({ userId: 'a', deskId: 12, deviceId: 'A' }), /30 dakikalık/);
+  const other = await api.reserve({ userId: 'a', deskId: 8, deviceId: 'A' });
+  assert.equal(other.desk.pendingOccupant, 'a');
+});
+
+test('an admin assignment does not erase restriction and is not reversed by a normal break', async () => {
+  const db = memoryDatabase({
+    'sgmUsers/a': { ...user('a'), restrictedUntil: 5000000, violationHistory: [50, 100], lastActiveTime: -2000000 },
+    'sgmDesks/1': desk(1)
+  });
+  let time = 1000;
+  const api = actions(db, () => time);
+  const assigned = await api.assign({ userId: 'a', deskId: 1 });
+  assert.equal(assigned.user.restrictedUntil, 5000000);
+  assert.deepEqual(assigned.user.violationHistory, [50, 100]);
+  assert.equal(assigned.user.adminDeskOverrideDeskId, 1);
+  assert.equal(assigned.user.adminDeskOverrideSessionStart, assigned.desks[0].sessionStartTime);
+  time += 30 * 60 * 1000 + 1;
+  await api.startBreak({ userId: 'a', deskId: 1, type: 'short' });
+  assert.equal(db.data.get('sgmDesks/1').status, 'on_break');
+  assert.equal(db.data.get('sgmUsers/a').restrictedUntil, 5000000);
+});
+
+test('an expired break can be reported and has precisely five minutes to verify', async () => {
+  const db = memoryDatabase({
+    'sgmUsers/reporter': { ...user('reporter'), activeDeskId: 2, canReport: true },
+    'sgmUsers/target': { ...user('target'), activeDeskId: 1 },
+    'sgmDesks/1': { ...desk(1), status: 'on_break', occupant: 'target', breakEndTime: 900 },
+    'sgmDesks/2': { ...desk(2), status: 'occupied', occupant: 'reporter' }
+  });
+  const api = actions(db);
+  const report = await api.reportDesk({ userId: 'reporter', deskId: 1, targetUserId: 'target' });
+  assert.equal(report.desk.reportEndTime, 301000);
+  assert.equal(report.desk.status, 'reported');
+  await api.verifyPresence({ userId: 'target', deskId: 1, qrCode: 'QR-1-test' });
+  assert.equal(db.data.get('sgmUsers/target').strikes, 0);
+});
+
+test('a report unresolved after 22:00 is cleared without a late penalty', async () => {
+  const reportStart = Date.parse('2026-10-13T18:58:00Z'); // 21:58 Turkey time
+  const deadline = reportStart + 5 * 60 * 1000;
+  let current = Date.parse('2026-10-13T19:03:00Z'); // 22:03 Turkey time
+  const db = memoryDatabase({
+    'sgmUsers/a': { ...user('a'), activeDeskId: 1, strikes: 1, violationHistory: [reportStart - 1000] },
+    'sgmDesks/1': { ...desk(1), status: 'reported', occupant: 'a', reportIssuedAt: reportStart, reportEndTime: deadline }
+  });
+  const result = await actions(db, () => current).expireDesk(1);
+  assert.equal(result.mode, 'closing_grace');
+  assert.equal(db.data.get('sgmDesks/1').status, 'available');
+  assert.equal(db.data.get('sgmUsers/a').strikes, 1);
+  assert.equal(db.data.get('sgmUsers/a').violationHistory.length, 1);
+});
+
+test('retrying an already-committed administrator assignment leaves the same occupant', async () => {
+  const db = memoryDatabase({ 'sgmUsers/a': user('a'), 'sgmDesks/1': desk(1) });
+  const api = actions(db);
+  await api.assign({ userId: 'a', deskId: 1 });
+  const count = db.writes.length;
+  const retry = await api.assign({ userId: 'a', deskId: 1 });
+  assert.equal(retry.alreadyApplied, true);
+  assert.equal(db.writes.length, count);
+  assert.equal(db.data.get('sgmDesks/1').occupant, 'a');
 });

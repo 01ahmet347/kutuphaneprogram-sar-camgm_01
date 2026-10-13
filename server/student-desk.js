@@ -35,6 +35,11 @@ export function createStudentDeskHandler({ authenticateStudent, createActions })
       }
 
       const actions = await createActions();
+      // Kapanıştan sonra istekler ceza üretemez; cron masa oturumlarını cezasız kapatır.
+      if (actions.closedNow?.()) {
+        if (action === 'expire') return res.status(200).json({ ok: true, result: null });
+        if (action !== 'cancel') return res.status(409).json({ ok: false, error: 'library_closed', message: 'Kütüphane 22.00 itibarıyla kapalı.' });
+      }
       const input = { userId: uid, deskId: Number(deskId) };
       const result = action === 'expire'
         ? await actions.expireDesk(Number(deskId))

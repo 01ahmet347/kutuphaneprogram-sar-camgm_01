@@ -1,6 +1,6 @@
 # Sarıçam Gençlik Merkezi Kütüphane Masa Takip Sistemi
 
-Sürüm: **2026.10.07.1**. Öğrenci GM Özel Kod ve şifreyle giriş yapar; masa seçimi/QR doğrulama, mola, boş masa ihbarı ve dilek/şikayet kullanılır. Yönetici kullanıcıları, masaları, kayıt/onayları, krokileri, ayarları, ihlalleri ve logları yönetir. Tutanak arayüzü ve belge üretimi kaldırılmıştır; ceza kuralları ve loglar korunmuştur.
+Sürüm: **2026.10.13.1**. Öğrenci GM Özel Kod ve şifreyle giriş yapar; masa seçimi/QR doğrulama, mola, boş masa ihbarı ve dilek/şikayet kullanılır. Yönetici kullanıcıları, masaları, kayıt/onayları, krokileri, ayarları, ihlalleri ve logları yönetir. Tutanak arayüzü ve belge üretimi kaldırılmıştır; ceza kuralları ve loglar korunmuştur.
 
 Bu paket henüz canlıya uygulanmadı. Yerel testlerin geçmesi, gerçek Firestore kurallarının ve telefondaki push teslimatının doğrulandığı anlamına gelmez.
 
@@ -51,10 +51,11 @@ Node.js 22 LTS kullanın. `npm ci`, `npm test`, `npm run build` komutlarıyla ku
 
 ## Canlı sürümü öğrenme
 
-Yeni sürüm ekranın altında `Sürüm 2026.10.07.1` yazar. `/api/version` canlı sunucu sürümünü ve Vercel commit kimliğini; `/version.json` ön yüz derlemesini gösterir. Eski sürümde Vercel > Project > Deployments > Production deployment > Source/Commit ve domain ataması kontrol edilir. Gönderilen eski arşivin dist çıktısı ile kaynak kodu aynı sürüm değildir; mevcut canlı bundle da bu arşivdeki dist'ten farklıdır. Yalnız arşive bakarak canlı commit kesin belirlenemez.
+Yeni sürüm ekranın altında `Sürüm 2026.10.13.1` yazar. `/api/version` canlı sunucu sürümünü ve Vercel commit kimliğini; `/version.json` ön yüz derlemesini gösterir. Eski sürümde Vercel > Project > Deployments > Production deployment > Source/Commit ve domain ataması kontrol edilir. Gönderilen eski arşivin dist çıktısı ile kaynak kodu aynı sürüm değildir; mevcut canlı bundle da bu arşivdeki dist'ten farklıdır. Yalnız arşive bakarak canlı commit kesin belirlenemez.
 
 ## Test kapsamı
 
 `npm test`: eşzamanlı masa/kullanıcı/cihaz rezervasyonları, QR, admin ataması, tek seferlik ceza, silme koruması, eski cihazın kaydı yeniden yazmaması, oturum devamlılığı, sınırlı eşzamanlı işlemler, tüm 17 panel/görünümün sunucu render kontrolü ve service worker bildirimi testleri. Transaction testleri bellek içi eşzamanlı veritabanı ile yapılır; Firebase emulator veya üretim veritabanı testi değildir. Gerçek Rules, Vercel fonksiyonları ve telefon teslimatı ayrıca doğrulanmalıdır.
-#   k u t u p h a n e p r o g r a m - s a r - c a m g m _ 0 1  
+#   k u t u p h a n e p r o g r a m - s a r - c a m g m _ 0 1 
+ 
  

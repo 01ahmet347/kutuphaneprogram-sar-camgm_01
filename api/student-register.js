@@ -81,24 +81,28 @@ const handler = createStudentRegistrationHandler({
       req.socket?.remoteAddress ||
       'unknown';
 
-    const key = createHash('sha256').update(String(clientAddress)).digest('hex');
+    // Shared Wi-Fi: ten tries are counted per verified anonymous device,
+    // with a higher shared-network abuse ceiling retained for protection.
+    const ipHash = createHash('sha256').update(String(clientAddress)).digest('hex');
+    const key = createHash('sha256').update(`${ipHash}:${uid}`).digest('hex');
     const ref = dataCollection('sgmRegistrationAttempts').doc(key);
+    const networkRef = dataCollection('sgmRegistrationAttempts').doc(`network-${ipHash}`);
     const at = Date.now();
 
     return ref.firestore.runTransaction(async tx => {
-      const snapshot = await tx.get(ref);
+      const [snapshot, networkSnapshot] = await Promise.all([tx.get(ref), tx.get(networkRef)]);
       const previous = snapshot.data() || {};
+      const network = networkSnapshot.data() || {};
       const windowStart = Number(previous.windowStart || 0);
+      const networkStart = Number(network.windowStart || 0);
       const attempts = windowStart > at - 60 * 60 * 1000
-        ? Number(previous.attempts || 0) + 1
-        : 1;
-
-      tx.set(ref, {
-        attempts,
-        windowStart: attempts === 1 ? at : windowStart,
-        updatedAt: at
-      });
-      return attempts > 10;
+        ? Number(previous.attempts || 0) + 1 : 1;
+      const networkAttempts = networkStart > at - 60 * 60 * 1000
+        ? Number(network.attempts || 0) + 1 : 1;
+      tx.set(ref, { attempts, windowStart: attempts === 1 ? at : windowStart, updatedAt: at });
+      tx.set(networkRef, { attempts: networkAttempts,
+        windowStart: networkAttempts === 1 ? at : networkStart, updatedAt: at });
+      return attempts > 10 || networkAttempts > 100;
     });
   }),
 
