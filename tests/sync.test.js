@@ -320,3 +320,138 @@ test('retrying an already-committed administrator assignment leaves the same occ
   assert.equal(db.writes.length, count);
   assert.equal(db.data.get('sgmDesks/1').occupant, 'a');
 });
+
+// Regression: a previous day's stale user link must never trap a returning student
+// or alter the new occupant of their former seat.
+test('next-day stale leave clears only the old user link, preserving a new occupant', async () => {
+  const newOccupant = {...user('b'), activeDeskId:1};
+  const previous = {...user('a'), activeDeskId:1, activeDeskRole:'owner', strikes:1, violationsResetDate:'2026-10-07', violationHistory:[123], pin:'secret-pin'};
+  const busyDesk = {...desk(1), status:'occupied', occupant:'b', sessionStartTime:950};
+  const db = memoryDatabase({'sgmUsers/a':previous,'sgmUsers/b':newOccupant,'sgmDesks/1':busyDesk});
+  const result = await actions(db).leaveDesk({userId:'a',deskId:1});
+  assert.equal(result.mode,'stale_session_cleared');
+  assert.equal(result.user.activeDeskId,null);
+  assert.equal(result.user.deskReclaimAllowedAt,undefined);
+  assert.equal(result.user.strikes,1);
+  assert.deepEqual(result.user.violationHistory,[123]);
+  assert.equal(result.user.pin,'secret-pin');
+  assert.deepEqual(db.data.get('sgmDesks/1'),busyDesk);
+  assert.deepEqual(db.data.get('sgmUsers/b'),newOccupant);
+  assert.equal(db.writes.filter(w=>w.key==='sgmDesks/1').length,0);
+  // Repeated call is idempotent: no waiting period and no changes on the second call.
+  const before = db.writes.length;
+  const retry = await actions(db).leaveDesk({userId:'a',deskId:1});
+  assert.equal(retry.mode,'already_not_here');
+  assert.equal(db.writes.length,before);
+});
+
+test('old desk no longer exists: leave removes only the obsolete profile reference', async () => {
+  const db=memoryDatabase({'sgmUsers/a':{...user('a'),activeDeskId:1}});
+  const result=await actions(db).leaveDesk({userId:'a',deskId:1});
+  assert.equal(result.mode,'stale_session_cleared');
+  assert.equal(result.desk,null);
+  assert.equal(db.data.get('sgmUsers/a').activeDeskId,null);
+  assert.equal(db.writes.some(w=>w.key==='sgmDesks/1'),false);
+});
+
+test('stale user link does not prevent a new day reservation on a different desk', async () => {
+  const db=memoryDatabase({
+    'sgmUsers/a':{...user('a'),activeDeskId:1},
+    'sgmUsers/b':{...user('b'),activeDeskId:1},
+    'sgmDesks/1':{...desk(1),status:'occupied',occupant:'b'},
+    'sgmDesks/2':desk(2)
+  });
+  await actions(db).reserve({userId:'a',deskId:2,deviceId:'A'});
+  assert.equal(db.data.get('sgmUsers/a').activeDeskId,null);
+  assert.equal(db.data.get('sgmUsers/a').pendingDeskId,2);
+  assert.equal(db.data.get('sgmDesks/1').occupant,'b');
+  assert.equal(db.data.get('sgmDesks/2').pendingOccupant,'a');
+  await actions(db).claim({userId:'a',deskId:2,deviceId:'A',qrCode:'QR-2-test'});
+  assert.equal(db.data.get('sgmUsers/a').activeDeskId,2);
+});
+
+test('a genuinely active session in another seat is never silently cleared', async () => {
+  const db=memoryDatabase({
+    'sgmUsers/a':{...user('a'),activeDeskId:1},
+    'sgmDesks/1':{...desk(1),status:'occupied',occupant:'a'},
+    'sgmDesks/2':desk(2)
+  });
+  await assert.rejects(actions(db).reserve({userId:'a',deskId:2,deviceId:'A'}),/aktif bir masanız/);
+  assert.equal(db.data.get('sgmUsers/a').activeDeskId,1);
+  const retry = await actions(db).leaveDesk({userId:'a',deskId:2});
+  assert.equal(retry.mode,'already_not_here');
+  assert.equal(db.data.get('sgmUsers/a').activeDeskId,1);
+});
+
+test('when the user owns a desk but the profile was cleared at rollover, leave still works', async () => {
+  const db=memoryDatabase({
+    'sgmUsers/a':user('a'),
+    'sgmDesks/1':{...desk(1),status:'occupied',occupant:'a',sessionStartTime:400}
+  });
+  const result=await actions(db).leaveDesk({userId:'a',deskId:1});
+  assert.equal(result.mode,'desk_empty');
+  assert.equal(db.data.get('sgmDesks/1').occupant,null);
+  assert.equal(db.data.get('sgmUsers/a').deskReclaimDeskId,1);
+  assert.equal(db.data.get('sgmUsers/a').deskReclaimAllowedAt,1000 + 30*60*1000);
+});
+
+test('guest can leave while the seat owner and their ongoing session stay untouched', async () => {
+  const db=memoryDatabase({
+    'sgmUsers/a':{...user('a'),activeDeskId:1,activeDeskRole:'owner'},
+    'sgmUsers/g':{...user('g'),activeDeskId:1,activeDeskRole:'guest'},
+    'sgmDesks/1':{...desk(1),status:'occupied',occupant:'a',sessionStartTime:300,guestOccupant:'g',guestSessionStartTime:500,guestBreakEndTime:900}
+  });
+  const result=await actions(db).leaveDesk({userId:'g',deskId:1});
+  assert.equal(result.mode,'guest_left');
+  assert.equal(result.desk.occupant,'a');
+  assert.equal(result.desk.sessionStartTime,300);
+  assert.equal(result.desk.guestOccupant,null);
+  assert.equal(result.desk.guestBreakEndTime,null);
+  assert.equal(db.data.get('sgmUsers/a').activeDeskId,1);
+  assert.equal(db.data.get('sgmUsers/g').activeDeskId,null);
+});
+
+test('owner exit promotes existing guest without resetting their ongoing login',async()=>{
+  const db=memoryDatabase({
+    'sgmUsers/a':{...user('a'),activeDeskId:1,activeDeskRole:'owner'},
+    'sgmUsers/g':{...user('g'),activeDeskId:1,activeDeskRole:'guest',deviceId:'guest-phone'},
+    'sgmDesks/1':{...desk(1),status:'occupied',occupant:'a',guestOccupant:'g',guestSessionStartTime:500}
+  });
+  const result=await actions(db).leaveDesk({userId:'a',deskId:1});
+  assert.equal(result.mode,'owner_promoted_guest');
+  assert.equal(result.desk.occupant,'g');
+  assert.equal(result.desk.ownerDeviceId,'guest-phone');
+  assert.equal(db.data.get('sgmUsers/g').activeDeskRole,'owner');
+});
+
+test('attempting to leave an old seat never removes a newly acquired live seat',async()=>{
+  const db=memoryDatabase({
+    'sgmUsers/a':{...user('a'),activeDeskId:2,activeDeskRole:'owner'},
+    'sgmDesks/1':{...desk(1),status:'occupied',occupant:'b'},
+    'sgmDesks/2':{...desk(2),status:'occupied',occupant:'a'}
+  });
+  const result=await actions(db).leaveDesk({userId:'a',deskId:1});
+  assert.equal(result.mode,'already_not_here');
+  assert.equal(result.user.activeDeskId,2);
+  assert.equal(db.data.get('sgmUsers/a').activeDeskId,2);
+  assert.equal(db.data.get('sgmDesks/2').occupant,'a');
+  assert.equal(db.writes.length,0);
+});
+
+test('cleanup of an orphan older owned desk preserves a newer active seat and its timer',async()=>{
+  const newUser={...user('a'),activeDeskId:2,activeDeskRole:'owner',lastActiveTime:2000,gmDeskAccessAt:2000,pendingDeskId:3,pendingDeskDeadline:5000};
+  const db=memoryDatabase({
+    'sgmUsers/a':newUser,
+    'sgmDesks/1':{...desk(1),status:'occupied',occupant:'a',sessionStartTime:100},
+    'sgmDesks/2':{...desk(2),status:'occupied',occupant:'a',sessionStartTime:1800},
+    'sgmDesks/3':{...desk(3),pendingOccupant:'a',pendingDeskDeadline:5000}
+  });
+  const result=await actions(db).leaveDesk({userId:'a',deskId:1});
+  assert.equal(result.mode,'desk_empty');
+  assert.equal(result.user.activeDeskId,2);
+  assert.equal(result.user.activeDeskRole,'owner');
+  assert.equal(result.user.lastActiveTime,2000);
+  assert.equal(result.user.pendingDeskId,3);
+  assert.equal(db.data.get('sgmDesks/2').occupant,'a');
+  assert.equal(db.data.get('sgmDesks/3').pendingOccupant,'a');
+});

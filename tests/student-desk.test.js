@@ -90,3 +90,23 @@ test('student desk endpoint routes break, report, verification, and leave action
 test('Istanbul day key follows the library timezone', () => {
   assert.equal(getIstanbulDayKey(new Date('2026-10-07T21:30:00.000Z')), '2026-10-08');
 });
+
+test('leave endpoint returns stale-session reconciliation without creating a false 30-minute wait',async()=>{
+  const handler=createStudentDeskHandler({
+    async authenticateStudent(){return 'returning-user';},
+    async createActions(){return {
+      async leaveDesk(input){
+        assert.deepEqual(input,{userId:'returning-user',deskId:16});
+        return {desk:{id:16,occupant:'another-student'},user:{id:'returning-user',activeDeskId:null,pin:'12345678'},at:1234,mode:'stale_session_cleared',alreadyApplied:true};
+      }
+    };}
+  });
+  const res=response();
+  await handler({method:'POST',body:{action:'leave',deskId:16,userId:'impostor'}},res);
+  assert.equal(res.code,200);
+  assert.equal(res.body.leaveMode,'stale_session_cleared');
+  assert.equal(res.body.alreadyApplied,true);
+  assert.equal(res.body.desk.occupant,'another-student');
+  assert.equal(res.body.user.activeDeskId,null);
+  assert.equal('pin' in res.body.user,false);
+});

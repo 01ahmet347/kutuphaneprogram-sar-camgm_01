@@ -5040,8 +5040,11 @@ function MainApp() {
   const releaseDesk = () => {
     if (!currentUser) return;
     const latestUser = usersRef.current.find(u => u.id === currentUser.id);
-    const ownedDesk = desksRef.current.find(d => d.occupant === currentUser.id || d.guestOccupant === currentUser.id);
-    const releaseDeskId = ownedDesk?.id || latestUser?.activeDeskId || currentUser.activeDeskId;
+    const activeId = latestUser?.activeDeskId || currentUser.activeDeskId;
+    const ownedDesk = desksRef.current.find(d => Number(d.id) === Number(activeId) &&
+      (d.occupant === currentUser.id || d.guestOccupant === currentUser.id)) ||
+      desksRef.current.find(d => d.occupant === currentUser.id || d.guestOccupant === currentUser.id);
+    const releaseDeskId = ownedDesk?.id || activeId;
     if (!releaseDeskId) return showMessage('Masa Bilgisi', 'Aktif masa kaydı bulunamadı. Güncel masa bilgilerini kontrol edin.', 'warning');
 
     setModal({
@@ -5061,12 +5064,18 @@ function MainApp() {
                         if (db) {
                           try {
                             const result = await runStudentDeskAction('leave', { deskId });
-                            if (!result?.desk && !result?.desks?.length) {
+                            const leaveMode = result?.leaveMode || result?.mode;
+                            const staleSession = leaveMode === 'stale_session_cleared';
+                            const alreadyGone = leaveMode === 'already_not_here';
+                            const returnedDesk = result?.desk || result?.desks?.find(d => Number(d.id) === Number(deskId));
+                            if (!staleSession && !alreadyGone && !returnedDesk) {
                               throw new Error('Sunucu masa bırakma işleminin güncel masa kaydını döndürmedi. İşlem doğrulanamadı.');
                             }
-                            const returnedDesk = result.desk || result.desks.find(d => Number(d.id) === Number(deskId));
-                            if (!returnedDesk || returnedDesk.occupant === leavingUserId || returnedDesk.guestOccupant === leavingUserId) {
+                            if (returnedDesk?.occupant === leavingUserId || returnedDesk?.guestOccupant === leavingUserId) {
                               throw new Error('Sunucu kaydında masa hâlâ hesabınıza bağlı. Masa bırakma işlemi tamamlanmadı.');
+                            }
+                            if ((staleSession || alreadyGone) && result?.user?.id !== leavingUserId) {
+                              throw new Error('Eski masa kaydı sunucuda doğrulanamadı. Tekrar deneyin.');
                             }
                             applyCloudRows(result);
                             confirmedDeskGuardRef.current = null;
@@ -5074,22 +5083,30 @@ function MainApp() {
                             setSelectedDeskId(null);
                             setDeskSelectionDeadline(null);
                             setScannerConfig({ isOpen: false, mode: null, title: '' });
-                            releasedDeskGuardRef.current = {
+                            // Sadece GERÇEKTEN bırakılan masalar için 45 sn'lik
+                            // görünüm koruması ve 30 dk bekleme kaydı uygulanır.
+                            releasedDeskGuardRef.current = staleSession || alreadyGone ? null : {
                               userId: leavingUserId,
                               deskId: Number(deskId),
-                              mode: result.leaveMode || 'desk_empty',
+                              mode: leaveMode || 'desk_empty',
                               releasedAt: result.at || nowTime,
                               expiresAt: (result.at || nowTime) + 45000
                             };
-                            addLog('MASA_BIRAKILDI', `Masa ${deskId} isteyerek bırakıldı. Masa ve bekleyen rezervasyon kayıtları temizlendi.`, deskId, leavingUserId);
-                            addLog('MASA_BEKLEME_BASLADI', 'Masa bırakıldı; 30 dakikalık yeniden masa alma bekleme süresi başladı.', deskId, leavingUserId);
+                            if (!staleSession && !alreadyGone) {
+                              addLog('MASA_BIRAKILDI', `Masa ${deskId} isteyerek bırakıldı. Masa ve bekleyen rezervasyon kayıtları temizlendi.`, deskId, leavingUserId);
+                              addLog('MASA_BEKLEME_BASLADI', 'Masa bırakıldı; 30 dakikalık yeniden masa alma bekleme süresi başladı.', deskId, leavingUserId);
+                            }
                             closeMessage();
                             setView('student_dash');
                             setTimeout(() => showMessage(
                               'Başarılı',
-                              result.leaveMode === 'desk_empty'
-                                ? 'Masanızı bıraktınız. 30 dakika sonra yeniden masa alabilirsiniz. Sistem hatasında yönetici masa atayabilir.'
-                                : 'Masa oturumunuz sonlandırıldı. Sistem durumu senkronize edildi.',
+                              staleSession
+                                ? 'Önceki günden kalan eski masa bağlantınız temizlendi. Yeni masa seçebilirsiniz; hesabınız açık kalır.'
+                                : alreadyGone
+                                  ? 'Bu masa artık hesabınıza bağlı değil. Mevcut masa bilgileriniz güncellendi.'
+                                  : leaveMode === 'desk_empty'
+                                    ? 'Masanızı bıraktınız. 30 dakika sonra aynı masayı yeniden alabilirsiniz; farklı uygun bir masa seçebilirsiniz.'
+                                    : 'Masa oturumunuz sonlandırıldı. Sistem durumu senkronize edildi.',
                               'success'
                             ), 300);
                           } catch (error) {

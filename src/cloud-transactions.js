@@ -111,7 +111,7 @@ export function createCloudActions({
         tx.get(lockRef)
       ]);
 
-      const user = refreshDailyFields(requireUser(uSnap, tombstone));
+      let user = refreshDailyFields(requireUser(uSnap, tombstone));
       checkDeskAccess(user, deskId);
 
       if (!snapshotExists(dSnap)) {
@@ -119,6 +119,25 @@ export function createCloudActions({
       }
 
       const desk = dSnap.data();
+
+      // Gün sonu/önceki sürüm kaynaklı yalnızca kullanıcı tarafında kalan
+      // eski masa bağlantısı, yeni günün rezervasyonunu engellememeli.
+      // GERÇEK bir masa oturumu varsa (ana kullanıcı veya misafir) korunur.
+      if (user.activeDeskId) {
+        const oldDeskSnap = Number(user.activeDeskId) === Number(deskId)
+          ? dSnap
+          : await tx.get(deskRef(user.activeDeskId));
+        const oldDesk = snapshotExists(oldDeskSnap) ? oldDeskSnap.data() : null;
+        if (oldDesk?.occupant !== userId && oldDesk?.guestOccupant !== userId) {
+          user = {
+            ...user,
+            activeDeskId: null,
+            activeDeskRole: null,
+            adminDeskOverrideDeskId: null,
+            adminDeskOverrideSessionStart: null
+          };
+        }
+      }
 
       if (desk.status === 'disabled') {
         throw new Error('Bu masa kullanıma kapalı.');
@@ -551,29 +570,36 @@ export function createCloudActions({
           tx.get(deletedRef(userId))
         ]);
 
-        const user = refreshDailyFields(
-          requireExistingUser(uSnap, tombstone)
-        );
-
-        if (!snapshotExists(dSnap)) {
-          throw new Error('Masa bulunamadı.');
-        }
-
-        const desk = dSnap.data();
+        const user = refreshDailyFields(requireExistingUser(uSnap, tombstone));
+        const desk = snapshotExists(dSnap) ? dSnap.data() : null;
         const at = now();
+        const isOwner = desk?.occupant === userId;
+        const isGuest = desk?.guestOccupant === userId;
+        const linkedToRequestedDesk = Number(user.activeDeskId) === Number(deskId);
+        const preserveNewerAssignment = Boolean(user.activeDeskId) && !linkedToRequestedDesk;
 
-        if (
-          Number(user.activeDeskId) !== Number(deskId) ||
-          desk.occupant !== userId
-        ) {
-          throw new Error('Aktif masa oturumunuz bulunamadı.');
+        if (!isOwner && !isGuest) {
+          // 22:00 kapanışı, başka cihaz veya yeni gün nedeniyle masa artık
+          // kullanıcıya ait değil. Başkasının masasına ASLA dokunma.
+          if (!linkedToRequestedDesk) {
+            return { desk, user, at, mode: 'already_not_here', alreadyApplied: true };
+          }
+          // Sadece hesapta kalmış eski referansı temizle; bu işlem gerçek masa
+          // bırakma olmadığı için 30 dakikalık yeni bekleme süresi oluşturma.
+          const nextUser = {
+            ...user,
+            activeDeskId: null,
+            activeDeskRole: null,
+            adminDeskOverrideDeskId: null,
+            adminDeskOverrideSessionStart: null
+          };
+          tx.set(userRef(userId), nextUser);
+          return { desk, user: nextUser, at, mode: 'stale_session_cleared', alreadyApplied: true };
         }
 
         if (
-          (
-            desk.status === 'reported' &&
-            Number(desk.reportEndTime || 0) <= at
-          )
+          isOwner && desk.status === 'reported' &&
+          Number(desk.reportEndTime || 0) <= at
         ) {
           throw new Error(
             'Süreniz dolduğu için masa otomatik işlem bekliyor. Biraz sonra durumu yenileyin.'
@@ -581,27 +607,58 @@ export function createCloudActions({
         }
 
         const pendingSnap =
-          user.pendingDeskId &&
+          !preserveNewerAssignment && user.pendingDeskId &&
           Number(user.pendingDeskId) !== Number(deskId)
             ? await tx.get(deskRef(user.pendingDeskId))
             : null;
 
         let nextDesk;
         let promotedUser = null;
+        let mode;
 
-        if (desk.guestOccupant) {
+        if (isGuest) {
+          // Mevcut/önceki sürümlerde oluşturulmuş misafir oturumu.
+          // Ana kullanıcı ve onun masa oturumu aynen kalır.
+          nextDesk = releaseUserFromDesk(desk, userId);
+          mode = 'guest_left';
+        } else if (desk.guestOccupant) {
           const guestSnap = await tx.get(userRef(desk.guestOccupant));
+          promotedUser = snapshotExists(guestSnap) ? guestSnap.data() : null;
 
-          promotedUser = snapshotExists(guestSnap)
-            ? guestSnap.data()
-            : null;
+          if (promotedUser) {
+            nextDesk = {
+              ...desk,
+              occupant: desk.guestOccupant,
+              ownerDeviceId: promotedUser.deviceId || null,
+              sessionStartTime: desk.guestSessionStartTime || at,
+              status: 'occupied',
+              breakEndTime: null,
+              reportEndTime: null,
+              reportIssuedAt: null,
+              reportVerifiedAt: null,
+              guestOccupant: null,
+              guestSessionStartTime: null,
+              guestBreakEndTime: null,
+              guestReported: false,
+              guestReportEndTime: null,
+              guestReportIssuedAt: null,
+              guestReportVerifiedAt: null,
+              pendingOccupant: null,
+              pendingDeskRole: null,
+              pendingDeskDeadline: null,
+              pendingDeviceId: null
+            };
+            mode = 'owner_promoted_guest';
+          }
+        }
 
+        if (!nextDesk) {
           nextDesk = {
             ...desk,
-            occupant: desk.guestOccupant,
-            ownerDeviceId: promotedUser?.deviceId || null,
-            sessionStartTime: desk.guestSessionStartTime || at,
-            status: 'occupied',
+            status: desk.status === 'disabled' ? 'disabled' : 'available',
+            occupant: null,
+            ownerDeviceId: null,
+            sessionStartTime: null,
             breakEndTime: null,
             reportEndTime: null,
             reportIssuedAt: null,
@@ -618,39 +675,24 @@ export function createCloudActions({
             pendingDeskDeadline: null,
             pendingDeviceId: null
           };
-        } else {
-          nextDesk = {
-            ...desk,
-            status: desk.status === 'disabled'
-              ? 'disabled'
-              : 'available',
-            occupant: null,
-            ownerDeviceId: null,
-            sessionStartTime: null,
-            breakEndTime: null,
-            reportEndTime: null,
-            reportIssuedAt: null,
-            reportVerifiedAt: null,
-            pendingOccupant: null,
-            pendingDeskRole: null,
-            pendingDeskDeadline: null,
-            pendingDeviceId: null
-          };
+          mode = 'desk_empty';
         }
 
         const nextUser = {
           ...user,
-          activeDeskId: null,
-          activeDeskRole: null,
-          adminDeskOverrideDeskId: null,
-          adminDeskOverrideSessionStart: null,
-          pendingDeskId: null,
-          pendingDeskDeadline: null,
-          lastActiveTime: at,
+          // Eski bir masanın kalıntısı kapatılıyorsa yeni masadaki aktif
+          // oturuma ve yönetici istisnasına dokunma.
+          activeDeskId: linkedToRequestedDesk ? null : user.activeDeskId,
+          activeDeskRole: linkedToRequestedDesk ? null : user.activeDeskRole,
+          adminDeskOverrideDeskId: linkedToRequestedDesk ? null : user.adminDeskOverrideDeskId,
+          adminDeskOverrideSessionStart: linkedToRequestedDesk ? null : user.adminDeskOverrideSessionStart,
+          pendingDeskId: preserveNewerAssignment ? user.pendingDeskId : null,
+          pendingDeskDeadline: preserveNewerAssignment ? user.pendingDeskDeadline : null,
+          lastActiveTime: preserveNewerAssignment ? user.lastActiveTime : at,
           deskReleasedAt: at,
           deskReclaimAllowedAt: at + 30 * 60 * 1000,
           deskReclaimDeskId: Number(deskId),
-          gmDeskAccessAt: at
+          gmDeskAccessAt: preserveNewerAssignment ? user.gmDeskAccessAt : at
         };
 
         tx.set(deskRef(deskId), nextDesk);
@@ -678,18 +720,11 @@ export function createCloudActions({
             pendingDeskDeadline: null,
             pendingDeviceId: null
           };
-
           tx.set(pendingSnap.ref, cleanPending);
           changedDesks.push(cleanPending);
         }
 
-        return {
-          desk: nextDesk,
-          user: nextUser,
-          desks: changedDesks,
-          at,
-          mode: promotedUser ? 'owner_promoted_guest' : 'desk_empty'
-        };
+        return { desk: nextDesk, user: nextUser, desks: changedDesks, at, mode };
       }),
 
     assign: ({ userId, deskId }) =>
