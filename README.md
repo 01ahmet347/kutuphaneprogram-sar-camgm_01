@@ -1,3 +1,5 @@
+> **15.10.2026 boş masa / öğrenci hesabı / 22.00 kapanış düzeltmesi:** Masa boşken öğrenci hesabında aktif masa kalması, kapanışın geçersiz bağlantıları atlaması ve gecikmiş tarayıcı yazmaları ele alındı. Yönetici panelindeki **Masa-Hesap Uyuşmazlığını Onar** düğmesiyle canlıdaki geçmiş kalıntıları da temizlenebilir. Kurulum ve kontroller: `MASA_HESAP_TUTARSIZLIGI_DUZELTMESI.md`.
+
 > **15.10.2026 masa ve gün değişimi düzeltmesi (2026.10.15.1):** Geçen günden kalan eski masa bağlantısının güvenli temizliği, aktif masa/oturumların korunması ve misafir masadan çıkışı düzeltildi. Tüm özellikler ve mevcut Firebase veri yolları korunur. Ayrıntılar `MASA_GUN_DEGISIMI_DUZELTMESI.md` dosyasında.
 
 > **13.10.2026 yönetici PC oturumu düzeltmesi (2026.10.13.2):** Firestore önbellek/geçici izin hatası artık yönetici panelini yanlışlıkla kapatmaz. Son aktif yönetici yetkisi sunucu ile doğrulanır. Yeni `api/admin-session.js` endpoint'ini aynı yayında dağıtın. Ayrıntılar `YAYIN_ONCESI_KONTROL.md` dosyasında.

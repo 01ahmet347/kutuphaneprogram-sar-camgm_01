@@ -1,7 +1,8 @@
 import { getAuth } from 'firebase-admin/auth';
 import { adminApp, dataCollection } from '../server/firebase-admin.js';
 import { requireActiveAdmin } from '../server/admin-session.js';
-import { outsideLibraryHours, closingDesk, closingUser } from '../server/daily-close.js';
+import { outsideLibraryHours, closingDesk, closeLibraryDay } from '../server/daily-close.js';
+import { userLinkPatch, releasedDeskUserPatch, publicUser, deskNeedsClosing } from '../server/desk-integrity.js';
 import { createCloudActions } from '../src/cloud-transactions.js';
 import { getIstanbulDayKey } from '../server/student-desk.js';
 
@@ -9,7 +10,8 @@ export default async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store');
   if (req.method !== 'POST') return res.status(405).json({ ok: false });
   const { action, deskId, userId } = req.body || {};
-  if (!['release', 'assign'].includes(action) || !Number.isInteger(deskId) || deskId < 1 || deskId > 35 ||
+  if (!['release', 'assign', 'repair', 'close_day'].includes(action) ||
+      (!['repair', 'close_day'].includes(action) && (!Number.isInteger(deskId) || deskId < 1 || deskId > 35)) ||
       (action === 'assign' && (typeof userId !== 'string' || !userId || userId.includes('/') || userId.length > 180))) {
     return res.status(400).json({ ok: false, error: 'invalid_request' });
   }
@@ -18,6 +20,41 @@ export default async function handler(req, res) {
     if (!token) return res.status(401).json({ ok: false });
     const admin = await getAuth(adminApp()).verifyIdToken(token);
     await requireActiveAdmin(admin);
+    if (action === 'close_day') {
+      // Admin onaylı manuel gün sonu işlemi de yalnızca yerel state'i değil,
+      // masa ve öğrenci belgelerini tek Firestore transaction içinde temizler.
+      const result = await closeLibraryDay({ force: true });
+      return res.status(200).json({ ok: true, result });
+    }
+    if (action === 'repair') {
+      // Yalnızca boşa düşmüş bağlantılar; gerçek ana kullanıcı ve misafirler kalır.
+      const firestore = dataCollection('sgmDesks').firestore;
+      const result = await firestore.runTransaction(async tx => {
+        const [desks, users] = await Promise.all([
+          tx.get(dataCollection('sgmDesks')), tx.get(dataCollection('sgmUsers'))
+        ]);
+        const deskMap = new Map(desks.docs.map(row => [String(row.id), row.data()]));
+        const repaired = [];
+        const at = Date.now();
+        for (const row of users.docs) {
+          const patch = userLinkPatch(row.data(), row.id, deskMap, at);
+          if (!Object.keys(patch).length) continue;
+          tx.set(row.ref, patch, { merge: true });
+          repaired.push(publicUser({ ...row.data(), ...patch }, row.id));
+        }
+        if (repaired.length) {
+          const auditRef = dataCollection('sgmAudit').doc(`admin-repair-${at}`);
+          tx.create(auditRef, {
+            id: auditRef.id, time: at, type: 'ADMIN_MASA_HESAP_ONARIMI',
+            message: `${repaired.length} öğrencinin geçersiz masa/rezervasyon bağlantısı onarıldı.`,
+            actorId: 'ADMIN', actorFirebaseUid: admin.uid, actorSessionId: admin.adminSessionId,
+            repairedCount: repaired.length, penaltyFree: true
+          });
+        }
+        return { repairedCount: repaired.length, users: repaired };
+      });
+      return res.status(200).json({ ok: true, ...result });
+    }
     if (action === 'assign') {
       const settingsSnapshot = await dataCollection('sgmConfig').doc('settings').get();
       const settings = settingsSnapshot.data() || {};
@@ -35,41 +72,36 @@ export default async function handler(req, res) {
     }
     const deskRef = dataCollection('sgmDesks').doc(String(deskId));
     const result = await deskRef.firestore.runTransaction(async tx => {
-      const deskSnap = await tx.get(deskRef);
+      // Masa zaten boş olsa bile ona bağlı eski öğrenci belgelerini ara.
+      const [deskSnap, allUsers] = await Promise.all([
+        tx.get(deskRef), tx.get(dataCollection('sgmUsers'))
+      ]);
       if (!deskSnap.exists) throw Object.assign(new Error('Masa bulunamadı.'), { status: 404 });
       const desk = deskSnap.data();
-      if (desk.status === 'available' && !desk.occupant && !desk.pendingOccupant && !desk.guestOccupant) {
+      const updates = [];
+      for (const snap of allUsers.docs) {
+        const patch = releasedDeskUserPatch(snap.data(), deskId);
+        if (Object.keys(patch).length) updates.push({ snap, patch });
+      }
+      const occupied = deskNeedsClosing(desk);
+      if (!occupied && !updates.length) {
         return { desks: [desk], users: [], user: null, alreadyApplied: true };
       }
-      const userIds = [...new Set([desk.occupant, desk.guestOccupant, desk.pendingOccupant].filter(Boolean))];
-      const userSnapshots = await Promise.all(userIds.map(id => tx.get(dataCollection('sgmUsers').doc(id))));
       const at = Date.now();
       const nextDesk = closingDesk(desk);
       const users = [];
-      userSnapshots.forEach(snap => {
-        if (!snap.exists) return;
-        const user = snap.data();
-        const updated = { ...user };
-        if (Number(user.activeDeskId) === deskId) Object.assign(updated, {
-          activeDeskId: null, activeDeskRole: null,
-          adminDeskOverrideDeskId: null, adminDeskOverrideSessionStart: null
-        });
-        if (Number(user.pendingDeskId) === deskId) Object.assign(updated, {
-          pendingDeskId: null, pendingDeskDeadline: null
-        });
-        tx.set(snap.ref, updated);
-        const { pin: _pin, pushTokens: _pushTokens, ...publicUser } = updated;
-        users.push(publicUser);
-      });
+      for (const { snap, patch } of updates) {
+        tx.set(snap.ref, patch, { merge: true });
+        users.push(publicUser({ ...snap.data(), ...patch }, snap.id));
+      }
       const auditRef = dataCollection('sgmAudit').doc(`admin-release-${deskId}-${at}`);
-      tx.set(deskRef, nextDesk);
+      if (occupied) tx.set(deskRef, nextDesk);
       tx.create(auditRef, {
         id: auditRef.id, time: at, type: 'ADMIN_MASA_BOSALTMA',
-        message: `Masa ${deskId} yönetici onayıyla cezasız boşaltıldı.`,
+        message: `Masa ${deskId} yönetici onayıyla cezasız boşaltıldı; ${updates.length} kullanıcı bağlantısı temizlendi.`,
         deskId, userId: desk.occupant || null,
         actorId: 'ADMIN', actorFirebaseUid: admin.uid,
-        actorSessionId: admin.adminSessionId,
-        penaltyFree: true
+        actorSessionId: admin.adminSessionId, penaltyFree: true
       });
       return { desks: [nextDesk], users, user: users[0] || null };
     });

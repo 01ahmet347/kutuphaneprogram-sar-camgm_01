@@ -52,6 +52,7 @@ import { getFirestore, doc, setDoc, onSnapshot, runTransaction, collection, getD
 
 import { getMessaging, getToken, onMessage, isSupported as isMessagingSupported } from 'firebase/messaging';
 import { mergePendingRows, nonConflictingPatch, atomicFieldPatch, changedFields, mapLimited, sessionCanRestore } from './src/sync-core.js';
+import { preventClosedHoursSessionWrites } from './src/session-write-guard.js';
 import { createCloudActions } from './src/cloud-transactions.js';
 import { APP_VERSION, BUILD_COMMIT } from './src/version.js';
 
@@ -1980,10 +1981,12 @@ function MainApp() {
     }
     if (user) {
       const normalized = normalizeRemoteUsers([user])[0];
-      granularBaselineRef.current.users.set(String(user.id), normalized);
-      usersRef.current = usersRef.current.map(row => row.id === user.id ? normalized : row);
+      const previousRow = usersRef.current.find(row => String(row.id) === String(user.id)) || {};
+      const merged = { ...previousRow, ...normalized };
+      granularBaselineRef.current.users.set(String(user.id), merged);
+      usersRef.current = usersRef.current.map(row => String(row.id) === String(user.id) ? merged : row);
       setUsers(usersRef.current);
-      setCurrentUser(previous => previous?.id === user.id ? { ...previous, ...normalized } : previous);
+      setCurrentUser(previous => previous?.id === user.id ? { ...previous, ...merged } : previous);
     }
   };
 
@@ -2010,6 +2013,7 @@ function MainApp() {
   const adminUserSaveInFlightRef = useRef(false);
   const adminUserSaveQueueRef = useRef(Promise.resolve());
   const [adminUserSavingId, setAdminUserSavingId] = useState(null);
+  const [repairDeskLinksBusy, setRepairDeskLinksBusy] = useState(false);
   const granularWriteChainRef = useRef(Promise.resolve());
   const quotaBackoffUntilRef = useRef(0);
   const deskQrRepairInFlightRef = useRef(false);
@@ -2223,7 +2227,9 @@ function MainApp() {
         }
         const remote = baselineKey === 'users' ? normalizeRemoteUsers([snap.data()])[0] : normalizeRemoteDesks([snap.data()])[0] || snap.data();
         const fields = baselineKey === 'desks' ? ['status','occupant','ownerDeviceId','pendingOccupant','pendingDeskDeadline','pendingDeskRole','breakEndTime','reportEndTime','reportIssuedAt','reportVerifiedAt','sessionStartTime'] : ['activeDeskId','activeDeskRole','pendingDeskId','pendingDeskDeadline'];
-        const patch = atomicFieldPatch(remote, previous, row, fields);
+        const patch = preventClosedHoursSessionWrites(
+          atomicFieldPatch(remote, previous, row, fields), baselineKey, Date.now(), settingsRef.current.openTime
+        );
         if (Object.keys(patch).length) tx.set(target, patch, { merge: true });
         return { ...remote, ...patch };
       });
@@ -6106,6 +6112,42 @@ function MainApp() {
     return { deletedCount: existingIds.size - failedIds.length, failedIds };
   };
 
+  const repairDanglingDeskLinks = async () => {
+    if (repairDeskLinksBusy || !db) return;
+    if (!window.confirm('Boş masalara veya geçersiz rezervasyonlara bağlı öğrenci kayıtları sunucuda kontrol edilip düzeltilecek. Gerçek aktif oturumlar korunur. Devam edilsin mi?')) return;
+    setRepairDeskLinksBusy(true);
+    try {
+      await requireAdminForUserWrite();
+      const token = await auth.currentUser.getIdToken();
+      const response = await fetch('/api/admin-desk', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ action: 'repair' })
+      });
+      const result = await response.json().catch(() => null);
+      if (!response.ok || result?.ok !== true) throw new Error(result?.message || 'Sunucu onarımı tamamlanamadı.');
+      if (result.users?.length) {
+        const patches = new Map(result.users.map(user => [String(user.id), user]));
+        usersRef.current = usersRef.current.map(row => {
+          const patch = patches.get(String(row.id));
+          if (!patch) return row;
+          const merged = { ...row, ...patch };
+          granularBaselineRef.current.users.set(String(merged.id), merged);
+          return merged;
+        });
+        setUsers(usersRef.current);
+        setCurrentUser(previous => previous && patches.has(String(previous.id))
+          ? { ...previous, ...patches.get(String(previous.id)) } : previous);
+      }
+      showMessage('Masa-Hesap Kontrolü Tamamlandı', `${result.repairedCount} öğrencinin geçersiz masa veya rezervasyon bağlantısı düzeltildi. Gerçek aktif masalar, GM kodları, şifreler, ihlal ve geçmiş kayıtları korunmuştur.`, 'success');
+    } catch (error) {
+      handleFirestoreQuotaError(error);
+      showMessage('Onarım Yapılamadı', error.message || 'Sunucuya bağlanılamadı.', 'warning');
+    } finally {
+      setRepairDeskLinksBusy(false);
+    }
+  };
+
   const handleAdminAction = async (action, deskId, userId = null) => {
     const nowTime = Date.now();
     const undoableAdminActions = new Set(['release', 'disable', 'enable', 'cancel_report', 'clear_strike', 'toggle_report_auth', 'toggle_block', 'assign_user', 'regenerate_qr']);
@@ -6132,7 +6174,7 @@ function MainApp() {
             applyCloudRows({ desks: result.desks, user: result.user });
             if (result.users?.length) {
               const map = new Map(result.users.map(u => [u.id, u]));
-              usersRef.current = (usersRef.current || []).map(u => map.get(u.id) || u);
+              usersRef.current = (usersRef.current || []).map(u => map.has(u.id) ? { ...u, ...map.get(u.id) } : u);
               setUsers(usersRef.current);
             }
             // Sunucu işlemi idempotent bir audit kaydı üretir; ikinci log yazmayız.
@@ -6611,6 +6653,10 @@ function MainApp() {
       Number(myDesk?.sessionStartTime) === Number(myUserObj.adminDeskOverrideSessionStart))); 
   const studentDeskWait = deskWaitRemaining(myUserObj, now);
   const filteredUsers = safeUsersList.filter(u => !userSearch.trim() || [u.name, u.specialCode, u.pin].some(value => String(value || '').toLocaleLowerCase('tr-TR').includes(userSearch.trim().toLocaleLowerCase('tr-TR'))));
+  const linkedDeskIsReal = u => !u.activeDeskId || (Array.isArray(desks) && desks.some(d =>
+    Number(d.id) === Number(u.activeDeskId) && (String(d.occupant || '') === String(u.id) || String(d.guestOccupant || '') === String(u.id))));
+  const invalidDeskAccountCount = adminUsersServerReady && granularLoadedRef.current.desks
+    ? safeUsersList.filter(u => !linkedDeskIsReal(u)).length : 0;
   const visibleLogs = [...new Map([...archivedLogs, ...(Array.isArray(logs) ? logs : [])].filter(l => !isRecordDeleted('logs', l.id) && !quietAuditEvents.has(l.type)).map(l => [l.id, l])).values()].sort((a,b) => b.time - a.time);
   const myDeskRole = myUserObj?.activeDeskRole || (myDesk?.guestOccupant === currentUser?.id ? 'guest' : 'owner');
   const myIsGuest = myDeskRole === 'guest';
@@ -8281,7 +8327,7 @@ function MainApp() {
                         </button>
                         <button
                           type="button"
-                          onClick={() => {
+                          onClick={async () => {
                             const ok = window.confirm(
                               'GÜN SONU TEMİZLİĞİ yapılsın mı?\n\n' +
                               '• Tüm aktif/rezerve masalar boşaltılır.\n' +
@@ -8292,6 +8338,24 @@ function MainApp() {
                               'Bu işlem gün içinde yalnızca gerektiğinde kullanılmalıdır.'
                             );
                             if (!ok) return;
+
+                            if (db) {
+                              try {
+                                await requireAdminForUserWrite();
+                                const token = await auth.currentUser.getIdToken();
+                                const response = await fetch('/api/admin-desk', {
+                                  method: 'POST',
+                                  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                                  body: JSON.stringify({ action: 'close_day' })
+                                });
+                                const payload = await response.json().catch(() => null);
+                                if (!response.ok || payload?.ok !== true) throw new Error(payload?.message || 'Sunucuda gün sonu temizliği yapılamadı.');
+                              } catch (error) {
+                                handleFirestoreQuotaError(error);
+                                showMessage('Gün Sonu Temizliği Yapılamadı', `Sunucudaki masa ve öğrenci kayıtları güvenle temizlenemedi: ${error.message}`, 'warning');
+                                return;
+                              }
+                            }
 
                             const result = runFullDayCleanup({
                               source: 'manual',
@@ -8416,6 +8480,11 @@ function MainApp() {
                       <div className="flex flex-wrap gap-2">
 
 
+                        <button type="button" disabled={!db || !adminAuthorized || !adminUsersServerReady || repairDeskLinksBusy} onClick={repairDanglingDeskLinks}
+                          className="px-3 py-2 bg-indigo-100 hover:bg-indigo-200 text-indigo-800 rounded-lg text-sm font-bold disabled:opacity-50"
+                          title="Canlı sunucudaki tüm öğrenci ve masa kayıtlarını karşılaştırır; yalnızca eski masa bağlantılarını temizler">
+                          {repairDeskLinksBusy ? 'Kontrol ediliyor…' : `Masa-Hesap Uyuşmazlığını Onar${invalidDeskAccountCount ? ` (${invalidDeskAccountCount} görünen)` : ''}`}
+                        </button>
                         <label className="text-sm">Kısıt günü <input type="number" min="1" step="1" value={bulkRestrictionDays} onChange={e=>setBulkRestrictionDays(e.target.value)} className="w-16 border rounded p-2" /></label><button onClick={()=>bulkUserAction('block')} className="px-3 py-2 bg-orange-100 text-orange-700 rounded-lg text-sm font-bold">Kısıt Ver</button>
                         <button onClick={()=>bulkUserAction('unblock')} className="px-3 py-2 bg-blue-100 text-blue-700 rounded-lg text-sm font-bold">Kısıtı Kaldır</button>
                         <button disabled={!selectedUserIds.length} onClick={()=>bulkUserAction('delete')} className="px-3 py-2 bg-red-600 hover:bg-red-700 disabled:bg-slate-300 text-white rounded-lg text-sm font-bold inline-flex items-center gap-2"><Trash2 className="w-4 h-4"/> Seçilenleri Sil ({selectedUserIds.length})</button>
@@ -8425,7 +8494,7 @@ function MainApp() {
                     <div className="mb-4 space-y-2"><label htmlFor="user-search" className="block font-bold text-slate-700">Kullanıcı Ara</label><input id="user-search" type="search" value={userSearch} onChange={e => setUserSearch(e.target.value)} placeholder="GM Özel Kod, şifre veya ad soyad yazın" className="w-full p-3 border rounded-xl"/><p className="text-xs text-slate-500">Bulunan: {filteredUsers.length} {userSearch && <button onClick={() => setUserSearch('')} className="ml-3 text-blue-700 font-bold">Aramayı temizle</button>}</p></div>
                     <table className="w-full text-left border-collapse text-sm min-w-[1100px]">
                       <thead><tr className="bg-slate-50 text-slate-500 border-b"><th className="p-3"><input type="checkbox" checked={filteredUsers.length > 0 && filteredUsers.every(u => selectedUserIds.includes(u.id))} onChange={e=>setSelectedUserIds(prev=>e.target.checked ? [...new Set([...prev, ...filteredUsers.map(u=>u.id)])] : prev.filter(id=>!filteredUsers.some(u=>u.id===id)))}/></th><th className="p-3">8 Haneli Şifre</th><th className="p-3">GM Özel Kod</th><th className="p-3">Hesap Durumu</th><th className="p-3">Aktif Masa</th><th className="p-3 text-center">İhlal</th><th className="p-3 text-center">İşlemler</th></tr></thead>
-                      <tbody>{filteredUsers.map(u=><tr key={u.id} className="border-b border-slate-100 hover:bg-slate-50"><td className="p-3"><input type="checkbox" checked={selectedUserIds.includes(u.id)} onChange={e=>setSelectedUserIds(prev=>e.target.checked?[...new Set([...prev,u.id])]:prev.filter(id=>id!==u.id))}/></td><td className="p-3 font-mono font-bold tracking-widest">{u.pin}</td><td className="p-3 font-mono font-black text-indigo-700 tracking-widest"><button onClick={() => openAdminUserEditor(u.id)} className="hover:underline">{u.specialCode || '-'}</button></td><td className="p-3">{u.blocked ? "Kısıtlı (Engelli)" : u.pendingApproval ? "Onay Bekliyor" : isRestricted(u, now) ? "Kısıtlı" : "Aktif"}<div className="text-xs text-slate-500 mt-1">İhbar: {isRestricted(u, now) ? "Hesap kısıtlı" : settings.reportsEnabled === false ? "Sistem genelinde kapalı" : u.canReport === false ? "Yetki kapalı" : "Açık"}</div></td><td className="p-3">{u.activeDeskId?`Masa ${u.activeDeskId}`:'Yok'}</td><td className="p-3 text-center text-red-600 font-bold">{u.strikes}</td><td className="p-3 text-center"><div className="flex flex-wrap justify-center gap-2"><button onClick={()=>openAdminUserEditor(u.id)} className="px-3 py-1 bg-blue-50 text-blue-700 rounded font-bold">Düzenle</button>{isRestricted(u, now) && <button disabled={adminUserSavingId !== null} onClick={()=>handleAdminAction('approve_account',null,u.id)} className="px-3 py-1 bg-green-50 text-green-700 rounded font-bold disabled:opacity-50">Hesabı Onayla / Kısıtı Kaldır</button>}<button onClick={()=>handleAdminAction('toggle_block',null,u.id)} className="px-3 py-1 bg-slate-100 rounded font-bold">{isRestricted(u)?'Kısıtlı':'Kısıt Ver'}</button><button onClick={()=>handleAdminAction('delete_user',null,u.id)} className="px-3 py-1 bg-red-50 text-red-600 rounded font-bold">Sil</button></div></td></tr>)}</tbody>
+                      <tbody>{filteredUsers.map(u=><tr key={u.id} className="border-b border-slate-100 hover:bg-slate-50"><td className="p-3"><input type="checkbox" checked={selectedUserIds.includes(u.id)} onChange={e=>setSelectedUserIds(prev=>e.target.checked?[...new Set([...prev,u.id])]:prev.filter(id=>id!==u.id))}/></td><td className="p-3 font-mono font-bold tracking-widest">{u.pin}</td><td className="p-3 font-mono font-black text-indigo-700 tracking-widest"><button onClick={() => openAdminUserEditor(u.id)} className="hover:underline">{u.specialCode || '-'}</button></td><td className="p-3">{u.blocked ? "Kısıtlı (Engelli)" : u.pendingApproval ? "Onay Bekliyor" : isRestricted(u, now) ? "Kısıtlı" : "Aktif"}<div className="text-xs text-slate-500 mt-1">İhbar: {isRestricted(u, now) ? "Hesap kısıtlı" : settings.reportsEnabled === false ? "Sistem genelinde kapalı" : u.canReport === false ? "Yetki kapalı" : "Açık"}</div></td><td className="p-3">{u.activeDeskId ? <>{`Masa ${u.activeDeskId}`}{!linkedDeskIsReal(u) && <span className="ml-2 text-xs font-semibold text-amber-700">(Kayıt uyuşmuyor)</span>}</> : 'Yok'}</td><td className="p-3 text-center text-red-600 font-bold">{u.strikes}</td><td className="p-3 text-center"><div className="flex flex-wrap justify-center gap-2"><button onClick={()=>openAdminUserEditor(u.id)} className="px-3 py-1 bg-blue-50 text-blue-700 rounded font-bold">Düzenle</button>{isRestricted(u, now) && <button disabled={adminUserSavingId !== null} onClick={()=>handleAdminAction('approve_account',null,u.id)} className="px-3 py-1 bg-green-50 text-green-700 rounded font-bold disabled:opacity-50">Hesabı Onayla / Kısıtı Kaldır</button>}<button onClick={()=>handleAdminAction('toggle_block',null,u.id)} className="px-3 py-1 bg-slate-100 rounded font-bold">{isRestricted(u)?'Kısıtlı':'Kısıt Ver'}</button><button onClick={()=>handleAdminAction('delete_user',null,u.id)} className="px-3 py-1 bg-red-50 text-red-600 rounded font-bold">Sil</button></div></td></tr>)}</tbody>
                     </table>
                   </div>
                 </div>

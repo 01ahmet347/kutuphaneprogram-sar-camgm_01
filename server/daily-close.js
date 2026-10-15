@@ -1,6 +1,7 @@
 // Server-side, penalty-free 22:00 cleanup. QR codes and user credentials are untouched.
 import { dataCollection } from './firebase-admin.js';
 import { getIstanbulDayKey } from './student-desk.js';
+import { deskNeedsClosing } from './desk-integrity.js';
 
 export function istanbulClock(at = Date.now()) {
   const parts = new Intl.DateTimeFormat('en-GB', {
@@ -39,8 +40,8 @@ export function closingUser(user) {
   };
 }
 
-export async function closeLibraryDay({ at = Date.now(), collection = dataCollection } = {}) {
-  if (!afterClosing(at)) return { closed: false, reason: 'before_close' };
+export async function closeLibraryDay({ at = Date.now(), collection = dataCollection, force = false } = {}) {
+  if (!force && !afterClosing(at)) return { closed: false, reason: 'before_close' };
   const day = istanbulClock(at).dayKey;
   const desksCol = collection('sgmDesks');
   const usersCol = collection('sgmUsers');
@@ -50,24 +51,47 @@ export async function closeLibraryDay({ at = Date.now(), collection = dataCollec
     const [previous, deskRows, userRows] = await Promise.all([
       tx.get(marker), tx.get(desksCol), tx.get(usersCol)
     ]);
-    if (previous.exists) return { closed: false, reason: 'already_closed', day };
+    // Önceki kapanış işaretine rağmen tekrar tarama yap: daha sonra gelen eski
+    // tarayıcı kayıtları, boş masada kalan öğrencileri yeniden oluşturmuş olabilir.
     let deskCount = 0;
     let userCount = 0;
+    const closedDesks = [];
     for (const doc of deskRows.docs) {
       const desk = doc.data();
-      const active = Boolean(desk.occupant || desk.pendingOccupant || desk.guestOccupant ||
-        desk.status === 'on_break' || desk.status === 'reported');
-      if (!active) continue;
+      if (!deskNeedsClosing(desk)) continue;
       tx.set(doc.ref, closingDesk(desk));
+      closedDesks.push({ id: doc.id, occupant: desk.occupant || desk.guestOccupant || desk.pendingOccupant || null });
       deskCount++;
     }
     for (const doc of userRows.docs) {
       const user = doc.data();
       if (!user.activeDeskId && !user.pendingDeskId && !user.adminDeskOverrideDeskId) continue;
-      tx.set(doc.ref, closingUser(user));
+      // Yalnızca masa/rezervasyon bağlantılarını değiştirir; kimlik, ihlal ve
+      // geçmiş kayıtlarını olduğu gibi korur.
+      tx.set(doc.ref, {
+        activeDeskId: null, activeDeskRole: null,
+        pendingDeskId: null, pendingDeskDeadline: null,
+        adminDeskOverrideDeskId: null, adminDeskOverrideSessionStart: null
+      }, { merge: true });
       userCount++;
     }
-    tx.create(marker, { day, closedAt: at, deskCount, userCount, penaltyFree: true });
-    return { closed: true, day, deskCount, userCount };
+    if (previous.exists && deskCount === 0 && userCount === 0) {
+      return { closed: false, reason: 'already_closed', day, deskCount: 0, userCount: 0 };
+    }
+    for (const desk of closedDesks) {
+      const log = collection('sgmAudit').doc(`cron-close-${day}-${desk.id}`);
+      tx.set(log, {
+        id: log.id, time: at, type: 'KAPANIS_MASA_OTOMATIK_BOSALTILDI',
+        message: `Kapanışta Masa ${desk.id} cezasız otomatik boşaltıldı.`,
+        deskId: Number(desk.id), userId: desk.occupant,
+        actorId: 'SYSTEM', penaltyFree: true
+      });
+    }
+    tx.set(marker, {
+      day, closedAt: previous.exists ? previous.data()?.closedAt || at : at,
+      lastCheckedAt: at, deskCount, userCount, penaltyFree: true,
+      runCount: Number(previous.data()?.runCount || 0) + 1
+    }, { merge: true });
+    return { closed: true, day, deskCount, userCount, recovered: previous.exists };
   });
 }
