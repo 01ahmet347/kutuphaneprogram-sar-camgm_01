@@ -28,7 +28,9 @@ export function closingDesk(desk) {
     guestReported: false, guestReportEndTime: null, guestReportIssuedAt: null,
     guestReportVerifiedAt: null,
     pendingOccupant: null, pendingDeskRole: null, pendingDeskDeadline: null,
-    pendingDeviceId: null, breakEndTime: null, reportIssuedAt: null,
+    pendingDeviceId: null, breakEndTime: null, breakSessionId: null,
+    breakStartedAt: null, breakType: null, breakOwnerId: null,
+    breakDurationMinutes: null, reportIssuedAt: null,
     reportEndTime: null, reportVerifiedAt: null
   };
 }

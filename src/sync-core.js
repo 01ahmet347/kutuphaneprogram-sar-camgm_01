@@ -45,6 +45,8 @@ export function releaseUserFromDesk(desk, userId) {
   if (String(desk.occupant || '') === id) Object.assign(next, {
     status: desk.status === 'disabled' ? 'disabled' : 'available', occupant: null,
     ownerDeviceId: null, sessionStartTime: null, breakEndTime: null,
+    breakSessionId: null, breakStartedAt: null, breakType: null,
+    breakOwnerId: null, breakDurationMinutes: null,
     reportEndTime: null, reportIssuedAt: null, reportVerifiedAt: null
   });
   if (String(desk.pendingOccupant || '') === id) Object.assign(next, {

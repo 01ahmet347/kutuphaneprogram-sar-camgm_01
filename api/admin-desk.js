@@ -9,8 +9,8 @@ import { getIstanbulDayKey } from '../server/student-desk.js';
 export default async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store');
   if (req.method !== 'POST') return res.status(405).json({ ok: false });
-  const { action, deskId, userId } = req.body || {};
-  if (!['release', 'assign', 'repair', 'close_day'].includes(action) ||
+  const { action, deskId, userId, expectedOccupant, expectedSessionStartTime } = req.body || {};
+  if (!['release', 'assign', 'repair', 'close_day', 'disable', 'enable', 'cancel_report'].includes(action) ||
       (!['repair', 'close_day'].includes(action) && (!Number.isInteger(deskId) || deskId < 1 || deskId > 35)) ||
       (action === 'assign' && (typeof userId !== 'string' || !userId || userId.includes('/') || userId.length > 180))) {
     return res.status(400).json({ ok: false, error: 'invalid_request' });
@@ -78,27 +78,50 @@ export default async function handler(req, res) {
       ]);
       if (!deskSnap.exists) throw Object.assign(new Error('Masa bulunamadı.'), { status: 404 });
       const desk = deskSnap.data();
+      // Yeni atama araya girdiyse gecikmiş YP işlemi yeni kullanıcıyı çıkaramaz.
+      if (expectedSessionStartTime !== undefined &&
+          Number(desk.sessionStartTime || 0) !== Number(expectedSessionStartTime || 0) ||
+          expectedOccupant !== undefined &&
+          String(desk.occupant || '') !== String(expectedOccupant || '')) {
+        throw Object.assign(new Error('Masa oturumu değişti. Güncel listeyi yenileyip yeniden deneyin.'), { status: 409 });
+      }
+      if (action === 'enable') {
+        if (desk.occupant || desk.pendingOccupant || desk.guestOccupant)
+          throw Object.assign(new Error('Dolu masa tekrar açılamaz.'), { status: 409 });
+        const nextDesk = { ...desk, status: 'available' };
+        tx.set(deskRef, nextDesk);
+        return { desks: [nextDesk], users: [] };
+      }
+      if (action === 'cancel_report') {
+        if (desk.status !== 'reported' || !desk.occupant)
+          throw Object.assign(new Error('Güncel masada iptal edilecek ihbar yok.'), { status: 409 });
+        const nextDesk = { ...desk, status: 'occupied', reportEndTime: null,
+          reportIssuedAt: null, reportVerifiedAt: null };
+        tx.set(deskRef, nextDesk);
+        return { desks: [nextDesk], users: [] };
+      }
       const updates = [];
       for (const snap of allUsers.docs) {
         const patch = releasedDeskUserPatch(snap.data(), deskId);
         if (Object.keys(patch).length) updates.push({ snap, patch });
       }
       const occupied = deskNeedsClosing(desk);
-      if (!occupied && !updates.length) {
+      if (action === 'disable' && desk.status === 'disabled' && !occupied && !updates.length) return { desks: [desk], users: [], alreadyApplied: true };
+      if (action !== 'disable' && !occupied && !updates.length) {
         return { desks: [desk], users: [], user: null, alreadyApplied: true };
       }
       const at = Date.now();
-      const nextDesk = closingDesk(desk);
+      const nextDesk = { ...closingDesk(desk), ...(action === 'disable' ? { status: 'disabled' } : {}) };
       const users = [];
       for (const { snap, patch } of updates) {
         tx.set(snap.ref, patch, { merge: true });
         users.push(publicUser({ ...snap.data(), ...patch }, snap.id));
       }
-      const auditRef = dataCollection('sgmAudit').doc(`admin-release-${deskId}-${at}`);
-      if (occupied) tx.set(deskRef, nextDesk);
+      const auditRef = dataCollection('sgmAudit').doc(`admin-${action}-${deskId}-${at}`);
+      if (occupied || action === 'disable') tx.set(deskRef, nextDesk);
       tx.create(auditRef, {
-        id: auditRef.id, time: at, type: 'ADMIN_MASA_BOSALTMA',
-        message: `Masa ${deskId} yönetici onayıyla cezasız boşaltıldı; ${updates.length} kullanıcı bağlantısı temizlendi.`,
+        id: auditRef.id, time: at, type: action === 'disable' ? 'ADMIN_MASA_KAPATMA' : 'ADMIN_MASA_BOSALTMA',
+        message: `Masa ${deskId} yönetici onayıyla ${action === 'disable' ? 'kapatıldı' : 'cezasız boşaltıldı'}; ${updates.length} kullanıcı bağlantısı temizlendi.`,
         deskId, userId: desk.occupant || null,
         actorId: 'ADMIN', actorFirebaseUid: admin.uid,
         actorSessionId: admin.adminSessionId, penaltyFree: true

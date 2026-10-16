@@ -1,4 +1,5 @@
 import { releaseUserFromDesk, json } from './sync-core.js';
+import { allowedBreakDuration, dailyBreakState, isHourlyBreakAvailable } from './break-policy.js';
 
 // Web SDK: exists()
 // Admin SDK: exists
@@ -58,15 +59,9 @@ export function createCloudActions({
     const today = dayKey();
     let next = user;
 
-    if (user.breaksResetDate !== today) {
-      next = {
-        ...next,
-        breaks: {
-          short: Math.max(0, Number(settings().shortBreakCount) || 0),
-          long: Math.max(0, Number(settings().longBreakCount) || 0)
-        },
-        breaksResetDate: today
-      };
+    const freshBreakState = dailyBreakState(user, settings(), now(), today);
+    if (user.breaksResetDate !== today || (user.breaks?.hourly == null || !Number.isFinite(Number(user.breaks.hourly)))) {
+      next = { ...next, ...freshBreakState };
     }
 
     if (user.violationsResetDate !== today) {
@@ -291,7 +286,7 @@ export function createCloudActions({
 
     claim: input => reserveOrClaim('claim', input),
 
-    startBreak: ({ userId, deskId, type }) =>
+    startBreak: ({ userId, deskId, type, requestId }) =>
       runTransaction(db, async tx => {
         const [uSnap, dSnap, tombstone] = await Promise.all([
           tx.get(userRef(userId)),
@@ -308,6 +303,12 @@ export function createCloudActions({
         const desk = dSnap.data();
         const at = now();
         const breakCount = Number(user.breaks?.[type] || 0);
+        // Aynı HTTP isteğinin yanıtı kaybolursa tekrar denemek hakkı ikinci kez düşürmez.
+        if (requestId && desk.status === 'on_break' && desk.occupant === userId &&
+            Number(user.activeDeskId) === Number(deskId) &&
+            desk.breakSessionId === requestId) {
+          return { desk, user, at: now(), alreadyApplied: true };
+        }
         const privilegedDesk = Number(user.adminDeskOverrideDeskId) === Number(deskId) &&
           Number(user.adminDeskOverrideSessionStart) === Number(desk.sessionStartTime);
         if ((user.blocked || isRestricted(user, at)) && !privilegedDesk) {
@@ -324,7 +325,8 @@ export function createCloudActions({
           );
         }
 
-        if (!['short', 'long'].includes(type) || breakCount <= 0) {
+        if (!['short', 'long', 'hourly'].includes(type) || breakCount <= 0 ||
+            (type === 'hourly' && !isHourlyBreakAvailable(settings(), at))) {
           throw new Error('Bu mola hakkınız tükenmiş.');
         }
 
@@ -339,24 +341,21 @@ export function createCloudActions({
           );
         }
 
-        const duration = Number(
-          type === 'short'
-            ? settings().shortBreakDuration
-            : settings().longBreakDuration
-        );
+        const duration = allowedBreakDuration(settings(), type);
 
-        if (
-          !Number.isFinite(duration) ||
-          duration < 1 ||
-          duration > 240
-        ) {
+        if (duration === null) {
           throw new Error('Mola süresi ayarı geçersiz.');
         }
 
         const nextDesk = {
           ...desk,
           status: 'on_break',
-          breakEndTime: at + duration * 60 * 1000
+          breakEndTime: at + duration * 60 * 1000,
+          breakStartedAt: at,
+          breakType: type,
+          breakOwnerId: userId,
+          breakSessionId: requestId || `break-${deskId}-${at}`,
+          breakDurationMinutes: duration
         };
 
         const nextUser = {
@@ -364,13 +363,68 @@ export function createCloudActions({
           breaks: {
             ...user.breaks,
             [type]: breakCount - 1
+          },
+          lastBreakSession: {
+            id: nextDesk.breakSessionId, deskId: Number(deskId), type,
+            startedAt: at, endAt: nextDesk.breakEndTime, status: 'active'
           }
         };
 
         tx.set(deskRef(deskId), nextDesk);
         tx.set(userRef(userId), nextUser);
+        const log = ref('sgmAudit', `break-start-${nextDesk.breakSessionId}`);
+        tx.set(log, { id: `break-start-${nextDesk.breakSessionId}`, time: at,
+          type: 'MOLA_BASLATILDI_SUNUCU', deskId: Number(deskId), userId,
+          sessionId: nextDesk.breakSessionId, breakType: type, durationMinutes: duration });
 
         return { desk: nextDesk, user: nextUser, at };
+      }),
+
+    // Sadece doğrulanabilir erken sistem kopmaları için tek seferlik iade.
+    // QR dönüşü ve süre bitimi iade sebebi değildir.
+    repairInterruptedBreak: ({ userId, deskId }) =>
+      runTransaction(db, async tx => {
+        const [uSnap, dSnap, deleted] = await Promise.all([
+          tx.get(userRef(userId)), tx.get(deskRef(deskId)), tx.get(deletedRef(userId))
+        ]);
+        const user = requireExistingUser(uSnap, deleted);
+        if (!snapshotExists(dSnap)) throw new Error('Masa bulunamadı.');
+        const desk = dSnap.data();
+        const last = user.lastBreakSession;
+        const at = now();
+        if (!last || last.status === 'refunded') return { desk, user, at, alreadyApplied: true };
+        const sameSession = Number(user.activeDeskId) === Number(deskId) &&
+          desk.occupant === userId && Number(last.deskId) === Number(deskId) &&
+          (desk.breakSessionId === last.id || desk.breakSessionId == null) &&
+          Number(last.startedAt) >= Number(desk.sessionStartTime || 0);
+        const interruptedEarly = Number(last.endAt) > at &&
+          (desk.status === 'occupied' ||
+           desk.status === 'on_break' &&
+             (!Number.isFinite(Number(desk.breakEndTime)) ||
+              Number(desk.breakEndTime) < Number(last.startedAt) ||
+              Math.abs(Number(desk.breakEndTime) - Number(last.endAt)) > 1000));
+        if (!sameSession || !interruptedEarly || last.status !== 'active' ||
+            user.breaksResetDate !== dayKey() ||
+            !['short', 'long', 'hourly'].includes(last.type)) {
+          throw new Error('Otomatik iade için doğrulanmış erken sistem hatası bulunamadı.');
+        }
+        const afterDesk = {
+          ...desk, status: 'occupied', breakEndTime: null,
+          breakSessionId: null, breakStartedAt: null, breakType: null,
+          breakOwnerId: null, breakDurationMinutes: null
+        };
+        const afterUser = {
+          ...user,
+          breaks: { ...user.breaks, [last.type]: Number(user.breaks?.[last.type] || 0) + 1 },
+          lastBreakSession: { ...last, status: 'refunded', refundedAt: at, refundReason: 'verified_early_interruption' }
+        };
+        tx.set(deskRef(deskId), afterDesk);
+        tx.set(userRef(userId), afterUser);
+        const log = ref('sgmAudit', `break-refund-${last.id}`);
+        tx.set(log, { id: `break-refund-${last.id}`, time: at,
+          type: 'MOLA_HATA_IADE_SUNUCU', deskId: Number(deskId), userId,
+          sessionId: last.id, breakType: last.type, penaltyFree: true });
+        return { desk: afterDesk, user: afterUser, at, refunded: true };
       }),
 
     endBreak: ({ userId, deskId, qrCode }) =>
@@ -407,12 +461,20 @@ export function createCloudActions({
         const nextDesk = {
           ...desk,
           status: 'occupied',
-          breakEndTime: null
+          breakEndTime: null,
+          breakSessionId: null,
+          breakStartedAt: null,
+          breakType: null,
+          breakOwnerId: null,
+          breakDurationMinutes: null
         };
 
         const nextUser = {
           ...user,
-          lastActiveTime: at
+          lastActiveTime: at,
+          lastBreakSession: user.lastBreakSession?.id === desk.breakSessionId
+            ? { ...user.lastBreakSession, status: 'returned', returnedAt: at }
+            : user.lastBreakSession
         };
 
         tx.set(deskRef(deskId), nextDesk);

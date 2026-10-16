@@ -25,15 +25,45 @@ service cloud.firestore {
       allow write: if isAdminFor(appId);
     }
 
+    // Mevcut oturum ve mola alanları yalnızca güvenilir Admin SDK API'leri
+    // üzerinden değişir. Eski açık YP sekmeleri artık bu alanları geri yazamaz.
+    function deskSessionMutation() {
+      return request.resource.data.diff(resource.data).affectedKeys().hasAny([
+        'status', 'occupant', 'ownerDeviceId', 'sessionStartTime',
+        'guestOccupant', 'guestSessionStartTime', 'guestBreakEndTime',
+        'guestReported', 'guestReportEndTime', 'guestReportIssuedAt',
+        'guestReportVerifiedAt', 'pendingOccupant', 'pendingDeskRole',
+        'pendingDeskDeadline', 'pendingDeviceId', 'breakEndTime',
+        'breakSessionId', 'breakStartedAt', 'breakType', 'breakOwnerId',
+        'breakDurationMinutes', 'reportEndTime', 'reportIssuedAt',
+        'reportVerifiedAt'
+      ]);
+    }
+
+    function userSessionMutation() {
+      return request.resource.data.diff(resource.data).affectedKeys().hasAny([
+        'activeDeskId', 'activeDeskRole', 'pendingDeskId',
+        'pendingDeskDeadline', 'adminDeskOverrideDeskId',
+        'adminDeskOverrideSessionStart', 'lastBreakSession',
+        'lastActiveTime', 'gmDeskAccessAt', 'deskReclaimDeskId',
+        'deskReclaimAllowedAt'
+      ]);
+    }
+
     match /artifacts/{appId}/public/data/sgmDesks/{deskId} {
       allow read: if signedIn();
-      allow write: if isAdminFor(appId);
+      allow create: if isAdminFor(appId) &&
+        request.resource.data.status == 'available' &&
+        request.resource.data.occupant == null;
+      allow update: if isAdminFor(appId) && !deskSessionMutation();
+      allow delete: if false;
     }
 
     match /artifacts/{appId}/public/data/sgmUsers/{userId} {
       allow get: if isAdminFor(appId) || isStudent(userId);
       allow list: if isAdminFor(appId);
-      allow write: if isAdminFor(appId);
+      allow create, delete: if isAdminFor(appId);
+      allow update: if isAdminFor(appId) && !userSessionMutation();
     }
 
     match /artifacts/{appId}/public/data/sgmMessages/{userId} {

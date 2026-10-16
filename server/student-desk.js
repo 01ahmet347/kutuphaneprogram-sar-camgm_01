@@ -23,13 +23,13 @@ export function createStudentDeskHandler({ authenticateStudent, createActions })
       const uid = await authenticateStudent(req);
       if (!uid) return res.status(401).json({ ok: false, error: 'unauthenticated' });
 
-      const { action, deskId, deviceId, qrCode, type, targetUserId } = req.body || {};
-      if (!['reserve', 'claim', 'cancel', 'expire', 'break-start', 'break-end', 'report', 'verify', 'leave'].includes(action) ||
+      const { action, deskId, deviceId, qrCode, type, targetUserId, requestId } = req.body || {};
+      if (!['reserve', 'claim', 'cancel', 'expire', 'break-start', 'break-end', 'break-repair', 'report', 'verify', 'leave'].includes(action) ||
           !Number.isInteger(Number(deskId)) || Number(deskId) < 1 || Number(deskId) > 35 ||
           ['reserve', 'claim'].includes(action) &&
             (typeof deviceId !== 'string' || deviceId.length < 1 || deviceId.length > 180) ||
           ['claim', 'break-end', 'verify'].includes(action) && (typeof qrCode !== 'string' || qrCode.length < 1 || qrCode.length > 500) ||
-          action === 'break-start' && !['short', 'long'].includes(type) ||
+          action === 'break-start' && (!['short', 'long', 'hourly'].includes(type) || requestId != null && (typeof requestId !== 'string' || requestId.length > 128)) ||
           action === 'report' && (typeof targetUserId !== 'string' || !targetUserId || targetUserId.includes('/') || targetUserId.length > 180)) {
         return res.status(400).json({ ok: false, error: 'invalid_request' });
       }
@@ -46,6 +46,7 @@ export function createStudentDeskHandler({ authenticateStudent, createActions })
         : await actions[{
             'break-start': 'startBreak',
             'break-end': 'endBreak',
+            'break-repair': 'repairInterruptedBreak',
             report: 'reportDesk',
             verify: 'verifyPresence',
             leave: 'leaveDesk'
@@ -53,7 +54,7 @@ export function createStudentDeskHandler({ authenticateStudent, createActions })
             ...input,
             ...(action === 'reserve' || action === 'claim' ? { deviceId } : {}),
             ...(action === 'claim' || action === 'break-end' || action === 'verify' ? { qrCode } : {}),
-            ...(action === 'break-start' ? { type } : {}),
+            ...(action === 'break-start' ? { type, requestId } : {}),
             ...(action === 'report' ? { targetUserId } : {})
           });
       if (!result) return res.status(200).json({ ok: true, result: null });
@@ -70,6 +71,7 @@ export function createStudentDeskHandler({ authenticateStudent, createActions })
         alreadyApplied: result.alreadyApplied === true,
         mode: result.mode,
         verified: result.verified === true,
+        refunded: result.refunded === true,
         eventId: result.eventId
       });
     } catch (error) {

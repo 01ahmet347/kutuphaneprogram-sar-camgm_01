@@ -53,6 +53,8 @@ import { getFirestore, doc, setDoc, onSnapshot, runTransaction, collection, getD
 import { getMessaging, getToken, onMessage, isSupported as isMessagingSupported } from 'firebase/messaging';
 import { mergePendingRows, nonConflictingPatch, atomicFieldPatch, changedFields, mapLimited, sessionCanRestore } from './src/sync-core.js';
 import { preventClosedHoursSessionWrites } from './src/session-write-guard.js';
+import { withoutSessionWrites, isDeskOwnedByUser, safeBreakCountdown } from './src/authoritative-session.js';
+import { allowedBreakCount, allowedBreakDuration, isHourlyBreakAvailable, istanbulDayKey } from './src/break-policy.js';
 import { createCloudActions } from './src/cloud-transactions.js';
 import { APP_VERSION, BUILD_COMMIT } from './src/version.js';
 
@@ -146,12 +148,7 @@ const validateQrBackup = (value, expectedAppId) => {
   });
 };
 
-const getLocalDayKey = (date = new Date()) => {
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, '0');
-  const d = String(date.getDate()).padStart(2, '0');
-  return `${y}-${m}-${d}`;
-};
+const getLocalDayKey = (date = new Date()) => istanbulDayKey(date.getTime());
 
 
 
@@ -159,10 +156,10 @@ const getLocalDayKey = (date = new Date()) => {
 // Mevcut saat ayarlarıyla aynı cihaz saatini kullanır (kurum: Türkiye).
 const updatedBreakAllowance = (user, before, after) => {
   const next = {...(user.breaks || {})};
-  for (const type of ['short', 'long']) {
-    const key = type === 'short' ? 'shortBreakCount' : 'longBreakCount';
-    const oldLimit = Math.max(0, Number(before[key]) || 0);
-    const newLimit = Math.max(0, Number(after[key]) || 0);
+  for (const type of ['short', 'long', 'hourly']) {
+    const key = type === 'short' ? 'shortBreakCount' : type === 'long' ? 'longBreakCount' : 'hourlyBreakCount';
+    const oldLimit = allowedBreakCount(before, type);
+    const newLimit = allowedBreakCount(after, type);
     const remaining = Number.isFinite(Number(user.breaks?.[type])) ? Number(user.breaks[type]) : oldLimit;
     next[type] = Math.max(0, Math.min(newLimit, remaining + newLimit - oldLimit));
   }
@@ -261,7 +258,10 @@ const DEFAULT_SETTINGS = {
   openTime: '07:00',
   closeTime: '22:00',
   longBreakCount: 2,
-  longBreakDuration: 60,
+  longBreakDuration: 30,
+  hourlyBreakEnabled: true,
+  hourlyBreakCount: 1,
+  hourlyBreakDuration: 60,
   shortBreakCount: 5,
   shortBreakDuration: 15,
   breakCooldown: 30,
@@ -1149,6 +1149,29 @@ function MainApp() {
 
   const [currentUser, setCurrentUser] = useState(null);
   const [now, setNow] = useState(Date.now());
+  const [serverTimeOffsetMs, setServerTimeOffsetMs] = useState(0);
+  const [serverClockVerified, setServerClockVerified] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    const syncServerTime = async () => {
+      try {
+        const sent = Date.now();
+        const response = await fetch('/api/server-time', { cache: 'no-store' });
+        const data = await response.json();
+        const received = Date.now();
+        if (!response.ok || !Number.isFinite(Number(data?.at))) throw new Error('Saat doğrulanamadı');
+        if (!cancelled) {
+          setServerTimeOffsetMs(Number(data.at) - (sent + received) / 2);
+          setServerClockVerified(true);
+        }
+      } catch { if (!cancelled) setServerClockVerified(false); }
+    };
+    syncServerTime();
+    const timer = setInterval(syncServerTime, 5 * 60 * 1000);
+    window.addEventListener('focus', syncServerTime);
+    return () => { cancelled = true; clearInterval(timer); window.removeEventListener('focus', syncServerTime); };
+  }, []);
+
   const sessionRestoredRef = useRef(false);
   const missingSessionUserSinceRef = useRef(0);
   useEffect(() => {
@@ -1957,6 +1980,19 @@ function MainApp() {
     if (payload.result === null) return null;
     return payload;
   };
+  const runAdminMaintenance = async (action, input = {}) => {
+    if (!adminAuthorized || !auth?.currentUser) throw new Error('Yönetici yetkisi gerekli.');
+    await requireAdminForUserWrite();
+    const token = await auth.currentUser.getIdToken();
+    const response = await fetch('/api/admin-maintenance', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ action, ...input })
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok || payload?.ok !== true) throw new Error(payload?.message || 'Yönetici işlemi sunucuda tamamlanamadı.');
+    return payload.result;
+  };
   const runStudentActivity = async (action, input = {}) => {
     if (!fbUser) throw new Error('Öğrenci oturumu bulunamadı.');
     const idToken = await fbUser.getIdToken();
@@ -2147,8 +2183,11 @@ function MainApp() {
       identityNo: /^\d{8}$/.test(u.identityNo || '') ? u.identityNo : legacyIdentity(u.id),
       strikes: Number.isFinite(Number(u.strikes)) ? Number(u.strikes) : 0,
       breaks: {
-        short: Number.isFinite(Number(u.breaks?.short)) ? Number(u.breaks.short) : (sourceSettings?.shortBreakCount ?? DEFAULT_SETTINGS.shortBreakCount),
-        long: Number.isFinite(Number(u.breaks?.long)) ? Number(u.breaks.long) : (sourceSettings?.longBreakCount ?? DEFAULT_SETTINGS.longBreakCount)
+        ...u.breaks,
+        short: u.breaks?.short != null && Number.isFinite(Number(u.breaks.short)) ? Number(u.breaks.short) : (sourceSettings?.shortBreakCount ?? DEFAULT_SETTINGS.shortBreakCount),
+        long: u.breaks?.long != null && Number.isFinite(Number(u.breaks.long)) ? Number(u.breaks.long) : (sourceSettings?.longBreakCount ?? DEFAULT_SETTINGS.longBreakCount),
+        hourly: u.breaks?.hourly != null && Number.isFinite(Number(u.breaks.hourly))
+          ? Number(u.breaks.hourly) : allowedBreakCount(sourceSettings, 'hourly')
       },
       breaksResetDate: u.breaksResetDate || getLocalDayKey(),
       violationsResetDate: u.violationsResetDate || getLocalDayKey(),
@@ -2227,9 +2266,9 @@ function MainApp() {
         }
         const remote = baselineKey === 'users' ? normalizeRemoteUsers([snap.data()])[0] : normalizeRemoteDesks([snap.data()])[0] || snap.data();
         const fields = baselineKey === 'desks' ? ['status','occupant','ownerDeviceId','pendingOccupant','pendingDeskDeadline','pendingDeskRole','breakEndTime','reportEndTime','reportIssuedAt','reportVerifiedAt','sessionStartTime'] : ['activeDeskId','activeDeskRole','pendingDeskId','pendingDeskDeadline'];
-        const patch = preventClosedHoursSessionWrites(
+        const patch = withoutSessionWrites(preventClosedHoursSessionWrites(
           atomicFieldPatch(remote, previous, row, fields), baselineKey, Date.now(), settingsRef.current.openTime
-        );
+        ), baselineKey);
         if (Object.keys(patch).length) tx.set(target, patch, { merge: true });
         return { ...remote, ...patch };
       });
@@ -2501,7 +2540,10 @@ function MainApp() {
         if (userBackupRestoreInFlightRef.current) return;
         const remoteRows = snapshot.docs.map(d => ({ ...d.data(), id: d.id }));
         const normalized = normalizeRemoteUsers(remoteRows, settingsRef.current);
-        const merged = mergeRemoteWithPendingLocal('users', normalized, usersRef.current);
+        const merged = mergeRemoteWithPendingLocal('users', normalized, usersRef.current).map(row => {
+          const remote = normalized.find(r => String(r.id) === String(row.id));
+          return remote ? { ...remote, ...withoutSessionWrites(row, 'users') } : row;
+        });
         // Tarayıcı önbelleği ile sunucu arasındaki farkı yalnızca bilgilendirme için tut.
         // Eksik hesapları kendiliğinden geri oluşturma: daha önce silinmiş olabilirler.
         if (!adminUsersServerReady) {
@@ -2663,11 +2705,15 @@ function MainApp() {
             if (key === 'users') remoteRows = normalizeRemoteUsers(remoteRows, settingsRef.current);
             // Öğrenci masa işlemleri API tarafından yazılır. Öğrenci cihazındaki
             // eski doluluk bilgisi sunucunun boş masa kaydını ezmemelidir.
-            const mergedRows = key === 'desks' && !adminDataMode
-              ? remoteRows
-              : ['desks', 'users'].includes(key)
-                ? mergeRemoteWithPendingLocal(key, remoteRows, getLocalRows())
-                : remoteRows;
+            const mergedRows = ['desks', 'users'].includes(key) && adminDataMode
+              ? mergeRemoteWithPendingLocal(key, remoteRows, getLocalRows()).map(row => {
+                  const serverRow = remoteRows.find(remote => String(remote.id) === String(row.id));
+                  if (!serverRow) return row;
+                  const allowedLocal = withoutSessionWrites(row, key);
+                  // Kritik alanların kaynağı yalnızca Firestore'dur.
+                  return { ...serverRow, ...allowedLocal };
+                })
+              : remoteRows;
             if (key === 'desks' && !adminDataMode) {
               granularBaselineRef.current.desks = rowsToMap(remoteRows);
               granularSeenRemoteRef.current.desks = true;
@@ -3374,7 +3420,7 @@ function MainApp() {
     if (pendingUserDeletesRef.current.size && adminAuthorized) {
       for (const id of Array.from(pendingUserDeletesRef.current)) {
         try {
-          const result = await cloudActions.deleteUser(id, desksRef.current);
+          const result = await runAdminMaintenance('delete_user', { userId: id });
           applyCloudRows(result);
           granularBaselineRef.current.users.delete(id);
           pendingUserDeletesRef.current.delete(id);
@@ -3785,7 +3831,7 @@ function MainApp() {
     expiredDeskJobsRef.current.add(deskId);
     try {
       const result = adminAuthorized
-        ? await cloudActions.expireDesk(deskId)
+        ? await runAdminMaintenance('expire', { deskId })
         : await runStudentDeskAction('expire', { deskId });
       if (!result) return;
       applyCloudRows(result);
@@ -4171,7 +4217,7 @@ function MainApp() {
                   if (needUserReset) {
                      return {
                        ...u,
-                       breaks: { short: settings.shortBreakCount, long: settings.longBreakCount },
+                       breaks: { short: settings.shortBreakCount, long: settings.longBreakCount, hourly: allowedBreakCount(settings, 'hourly') },
                        breaksResetDate: todayKey,
                        violationsResetDate: todayKey,
                        strikes: 0,
@@ -4555,7 +4601,7 @@ function MainApp() {
           pendingApproval: true, restrictedUntil: 0,
           restrictionReason: 'Google Form kontrolü ve kütüphane sorumlusu onayı bekleniyor',
           activeDeskId: null, activeDeskRole: null, pendingDeskId: null, pendingDeskDeadline: null,
-          breaks: { short: settings.shortBreakCount, long: settings.longBreakCount },
+          breaks: { short: settings.shortBreakCount, long: settings.longBreakCount, hourly: allowedBreakCount(settings, 'hourly') },
           strikes: 0, blocked: false, canReport: true, createdAt: Date.now()
         });
         if (db) {
@@ -5339,7 +5385,8 @@ function MainApp() {
     const myUser = safeUsers.find(u => u.id === currentUser.id);
     if (!myUser) return;
     
-    if (myUser.breaks[type] <= 0) return showMessage("Uyarı", "Bu mola hakkınız tükenmiş.", "warning");
+    if (type === 'hourly' && !isHourlyBreakAvailable(settings, now + serverTimeOffsetMs)) return showMessage('Mola Kullanılamıyor', '1 Saatlik Mola yalnızca cuma günleri aktiftir.', 'warning');
+    if (Number(myUser.breaks?.[type] || 0) <= 0) return showMessage("Uyarı", "Bu mola hakkınız tükenmiş.", "warning");
 
     const lastActive = Number(myUser.lastActiveTime || 0);
     // Peş peşe mola kullanımını engelle: her mola arasında en az 30 dk aktif çalışma zorunlu.
@@ -5350,7 +5397,7 @@ function MainApp() {
     if (now - lastActive < cooldownMs) {
         const remainingMs = cooldownMs - (now - lastActive);
         const remainingMin = Math.ceil(remainingMs / 60000);
-        const breakLabel = type === 'short' ? 'Kısa mola' : 'Uzun mola';
+        const breakLabel = type === 'short' ? 'Kısa mola' : type === 'hourly' ? '1 Saatlik Mola' : 'Uzun mola';
         return showMessage(
           `${breakLabel} İçin Çalışma Süresi`,
           `${breakLabel} kullanabilmek için toplam ${requiredWorkMinutes} dakika aktif ders çalışmanız gerekiyor. Şu anda ${remainingMin} dakika daha çalışmalısınız.`,
@@ -5358,13 +5405,15 @@ function MainApp() {
         );
     }
 
-    const durationStr = type === 'short' ? settings.shortBreakDuration : settings.longBreakDuration;
+    const durationStr = allowedBreakDuration(settings, type);
+    if (durationStr === null) return showMessage('Mola Ayarı Hatası', 'YP panelinde mola süresini kontrol edin.', 'warning');
     const durationMs = durationStr * 60 * 1000;
 
     const myRole = myUser.activeDeskRole || 'owner';
     if (db) {
       try {
-        const result = await runStudentDeskAction('break-start', { deskId: currentUser.activeDeskId, type });
+        const result = await runStudentDeskAction('break-start', { deskId: currentUser.activeDeskId, type, requestId: (crypto.randomUUID ? crypto.randomUUID() : `MOLA-${Date.now()}-${generateId()}`) });
+        if (Number.isFinite(Number(result.at))) { setServerTimeOffsetMs(Number(result.at) - Date.now()); setServerClockVerified(true); }
         applyCloudRows(result);
       } catch (error) {
         handleFirestoreQuotaError(error);
@@ -5379,7 +5428,7 @@ function MainApp() {
       setUsers(prev => Array.isArray(prev) ? prev.map(u => u.id === currentUser.id ? { ...u, breaks: { ...u.breaks, [type]: u.breaks[type] - 1 } } : u) : []);
     }
     
-    addLog('MOLA_BAŞLADI', `${myRole === 'guest' ? 'Misafir - ' : ''}${type === 'short' ? 'Kısa' : 'Uzun'} mola başlatıldı.`, currentUser.activeDeskId, currentUser.id);
+    addLog('MOLA_BAŞLADI', `${myRole === 'guest' ? 'Misafir - ' : ''}${type === 'short' ? 'Kısa' : type === 'hourly' ? '1 Saatlik' : 'Uzun'} mola başlatıldı.`, currentUser.activeDeskId, currentUser.id);
   };
 
   const returnFromBreak = async (qrData) => {
@@ -6085,7 +6134,7 @@ function MainApp() {
     const results = await mapLimited(Array.from(existingIds), async id => {
       if (!db) { pendingUserDeletesRef.current.delete(id); return id; }
       if (!fbUser || !adminAuthorized) throw new Error('Yönetici oturumu veya bağlantı bekleniyor.');
-      const result = await cloudActions.deleteUser(id, desksRef.current);
+      const result = await runAdminMaintenance('delete_user', { userId: id });
       applyCloudRows(result);
       granularBaselineRef.current.users.delete(String(id));
       pendingUserDeletesRef.current.delete(id);
@@ -6151,13 +6200,39 @@ function MainApp() {
   const handleAdminAction = async (action, deskId, userId = null) => {
     const nowTime = Date.now();
     const undoableAdminActions = new Set(['release', 'disable', 'enable', 'cancel_report', 'clear_strike', 'toggle_report_auth', 'toggle_block', 'assign_user', 'regenerate_qr']);
-    if (undoableAdminActions.has(action)) {
+    // Sunucuda onaylanan masa oturumu geri alınamaz; yönetici yeni güvenli atama yapar.
+    // Diğer YP işlemlerinin Geri Al özelliği korunur.
+    if (undoableAdminActions.has(action) && !(db && ['release', 'disable', 'enable', 'cancel_report', 'assign_user'].includes(action))) {
       const actionLabels = {
         release: 'Masa boşaltma', disable: 'Masayı kullanıma kapatma', enable: 'Masayı kullanıma açma',
         cancel_report: 'Boş bildirimi iptal etme', clear_strike: 'İhlal silme', toggle_report_auth: 'İhbar yetkisi değiştirme',
         toggle_block: 'Kullanıcı engel durumu değiştirme', assign_user: 'Masaya kullanıcı atama', regenerate_qr: 'QR kod yenileme'
       };
       pushUndoSnapshot(actionLabels[action] || 'Yönetici işlemi');
+    }
+    // Masa sahipliği ve ihbar durumları her zaman sunucu transaction'ıyla değişir.
+    if (db && ['disable', 'enable', 'cancel_report'].includes(action)) {
+      try {
+        await requireAdminForUserWrite();
+        const token = await auth.currentUser.getIdToken();
+        const currentDesk = (desksRef.current || []).find(d => Number(d.id) === Number(deskId));
+        const response = await fetch('/api/admin-desk', {
+          method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ action, deskId: Number(deskId),
+            expectedOccupant: currentDesk?.occupant || null,
+            expectedSessionStartTime: currentDesk?.sessionStartTime || null })
+        });
+        const result = await response.json().catch(() => null);
+        if (!response.ok || result?.ok !== true) throw new Error(result?.message || 'Masa güncellenemedi.');
+        applyCloudRows({ desks: result.desks });
+        if (result.users?.length) {
+          const map = new Map(result.users.map(u => [String(u.id), u]));
+          usersRef.current = (usersRef.current || []).map(u => map.has(String(u.id)) ? { ...u, ...map.get(String(u.id)) } : u);
+          setUsers(usersRef.current);
+        }
+        showMessage('Masa Güncellendi', `Masa ${deskId} sunucuda güncellendi.`, 'success');
+      } catch (error) { handleFirestoreQuotaError(error); showMessage('Masa İşlemi Reddedildi', error.message, 'warning'); }
+      return;
     }
     switch (action) {
       case 'release':
@@ -6168,7 +6243,9 @@ function MainApp() {
             const token = await auth.currentUser.getIdToken();
             const response = await fetch('/api/admin-desk', { method: 'POST',
               headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-              body: JSON.stringify({ action: 'release', deskId: Number(deskId) }) });
+              body: JSON.stringify({ action: 'release', deskId: Number(deskId),
+                expectedOccupant: (desksRef.current || []).find(d => Number(d.id) === Number(deskId))?.occupant || null,
+                expectedSessionStartTime: (desksRef.current || []).find(d => Number(d.id) === Number(deskId))?.sessionStartTime || null }) });
             const result = await response.json().catch(() => null);
             if (!response.ok || result?.ok !== true) throw new Error(result?.message || 'Masa boşaltılamadı.');
             applyCloudRows({ desks: result.desks, user: result.user });
@@ -6647,7 +6724,8 @@ function MainApp() {
   const myUserObj = currentUser ? safeUsersList.find(u => u.id === currentUser.id) : null;
   const safeDesksList = Array.isArray(desks) ? desks : [];
   
-  const myDesk = myUserObj && myUserObj.activeDeskId ? safeDesksList.find(d => d.id === myUserObj.activeDeskId) : null;
+  const possibleMyDesk = myUserObj && myUserObj.activeDeskId ? safeDesksList.find(d => Number(d.id) === Number(myUserObj.activeDeskId)) : null;
+  const myDesk = isDeskOwnedByUser(possibleMyDesk, myUserObj) ? possibleMyDesk : null;
   const studentRestricted = !myUserObj || ((myUserObj.blocked || isRestricted(myUserObj, now)) &&
     !(myUserObj.activeDeskId && Number(myUserObj.adminDeskOverrideDeskId) === Number(myUserObj.activeDeskId) &&
       Number(myDesk?.sessionStartTime) === Number(myUserObj.adminDeskOverrideSessionStart))); 
@@ -6664,6 +6742,25 @@ function MainApp() {
   const myReportEndTime = myIsGuest ? myDesk?.guestReportEndTime : myDesk?.reportEndTime;
   const myBreakEndTime = myIsGuest ? myDesk?.guestBreakEndTime : myDesk?.breakEndTime;
   const myIsOnBreak = myIsGuest ? !!myDesk?.guestBreakEndTime : myDesk?.status === 'on_break';
+  const breakCountdown = myIsGuest
+    ? safeBreakCountdown({breakEndTime: myBreakEndTime}, now + serverTimeOffsetMs)
+    : safeBreakCountdown(myDesk, now + serverTimeOffsetMs);
+  const breakRepairAttemptRef = useRef(new Set());
+  useEffect(() => {
+    const last = myUserObj?.lastBreakSession;
+    if (!db || !serverClockVerified || !myDesk || myIsGuest || !last ||
+        last.status !== 'active' || Number(last.deskId) !== Number(myDesk.id) ||
+        Number(last.endAt) <= Date.now() + serverTimeOffsetMs ||
+        !((myDesk.status === 'on_break' && breakCountdown.kind === 'invalid') ||
+          myDesk.status === 'occupied')) return;
+    const key = String(last.id);
+    if (breakRepairAttemptRef.current.has(key)) return;
+    breakRepairAttemptRef.current.add(key);
+    runStudentDeskAction('break-repair', { deskId: myDesk.id })
+      .then(result => { if (result?.refunded) applyCloudRows(result); })
+      .catch(error => console.warn('Mola durumu onarılamadı:', error.message));
+  }, [myUserObj?.lastBreakSession?.id, myUserObj?.lastBreakSession?.status,
+      myDesk?.id, myDesk?.status, myDesk?.breakEndTime, serverClockVerified]);
 
   const validateUniqueCredentials = (candidate, existing, exceptId = null) => {
     const code = String(candidate.specialCode || '');
@@ -6694,6 +6791,8 @@ function MainApp() {
   };
 
   const pushUndoSnapshot = (label) => {
+    // Canlı hak değişikliği geriye dönük yeniden hesaplama gerektirir; eski ayarı snapshot'tan geri yazma.
+    if (db && label === 'Sistem ayarlarını kaydetme') return;
     const snapshot = {
       id: `UNDO-${Date.now()}-${generateId()}`,
       label,
@@ -6738,24 +6837,51 @@ function MainApp() {
         const restored = snapshot.users.filter(user => isRecordDeleted('users', user.id) || serverDeletedUserIdsRef.current.has(String(user.id)));
         const results = await mapLimited(restored, user => runTransaction(db, async tx => {
           const target = getLiveDoc('sgmUsers', user.id), marker = getLiveDoc('sgmDeletedUsers', user.id);
-          await tx.get(marker);
-          tx.delete(marker); tx.set(target, user);
+          const [ignored, existing] = await Promise.all([tx.get(marker), tx.get(target)]);
+          tx.delete(marker);
+          // Geri yüklenen hesap eski masayı geri alamaz; canlı oturum sahibi korunur.
+          if (!existing.exists()) tx.set(target, { ...withoutSessionWrites(user, 'users'),
+            activeDeskId: null, activeDeskRole: null, pendingDeskId: null, pendingDeskDeadline: null,
+            adminDeskOverrideDeskId: null, adminDeskOverrideSessionStart: null });
         }));
         if (results.some(result => result.status === 'rejected')) throw new Error('Geri alma sunucuya kaydedilemedi.');
         restored.forEach(user => { pendingUserDeletesRef.current.delete(String(user.id)); serverDeletedUserIdsRef.current.delete(String(user.id)); });
         localStorage.setItem('sgm_pending_user_deletes', JSON.stringify(Array.from(pendingUserDeletesRef.current)));
       } catch (error) { handleFirestoreQuotaError(error); return showMessage('Geri Alınamadı', error.message, 'warning'); }
     }
+    // Geri alma sırasında eski masa/aktif kullanıcı snapshot'ı asla canlının üzerine dönmez.
+    let restoredUsers = snapshot.users;
+    let restoredDesks = snapshot.desks;
+    if (db) {
+      try {
+        const [latestUsers, latestDesks] = await Promise.all([
+          getDocsFromServer(getLiveCollection('sgmUsers')),
+          getDocsFromServer(getLiveCollection('sgmDesks'))
+        ]);
+        const oldUsers = new Map(snapshot.users.map(row => [String(row.id), row]));
+        const oldDesks = new Map(snapshot.desks.map(row => [String(row.id), row]));
+        restoredUsers = latestUsers.docs.map(d => {
+          const current = { ...d.data(), id: d.id };
+          return { ...current, ...withoutSessionWrites(oldUsers.get(String(d.id)) || current, 'users') };
+        });
+        restoredDesks = latestDesks.docs.map(d => {
+          const current = { ...d.data(), id: Number(d.id) };
+          return { ...current, ...withoutSessionWrites(oldDesks.get(String(d.id)) || current, 'desks') };
+        });
+      } catch (error) {
+        return showMessage('Geri Alınamadı', 'Canlı masa ve kullanıcı kayıtları doğrulanamadı. Lütfen tekrar deneyin.', 'warning');
+      }
+    }
     restoreDeletedRecordProtectionFromSnapshot(snapshot);
     if (snapshot.settings) setSettings(snapshot.settings);
     if (Array.isArray(snapshot.layoutElements)) setLayoutElements(snapshot.layoutElements);
     snapshot.users.forEach(u=>deletedUserIds.delete(u.id));
-    setUsers(snapshot.users); usersRef.current = snapshot.users;
+    setUsers(restoredUsers); usersRef.current = restoredUsers;
     setLogs(snapshot.logs); logsRef.current = snapshot.logs;
     setArchivedLogs(snapshot.archivedLogs || []);
     setViolationRecords(snapshot.violationRecords); violationRecordsRef.current = snapshot.violationRecords;
     setFeedbackRecords(snapshot.feedbackRecords); feedbackRecordsRef.current = snapshot.feedbackRecords;
-    setDesks(snapshot.desks); desksRef.current = snapshot.desks;
+    setDesks(restoredDesks); desksRef.current = restoredDesks;
     setUndoStack(prev => prev.filter(item => item.id !== snapshot.id));
     setSelectedUserIds([]); setSelectedLogIds([]); setSelectedViolationIds([]); setSelectedFeedbackIds([]);
     addLog('ADMIN_GERI_AL', `${snapshot.label} işlemi geri alındı.`);
@@ -6801,7 +6927,7 @@ function MainApp() {
         const specialCode = createEightDigitCode(usedSecrets);
         newUser = {id: 'U' + (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + generateId()), name: name.trim(), identityNo, pin, specialCode,
           pendingApproval: true, restrictionReason: 'Sorumlu onayı bekleniyor', restrictedUntil: 0,
-          activeDeskId: null, breaks: {short: settings.shortBreakCount, long: settings.longBreakCount}, strikes: 0, blocked: false, canReport: true};
+          activeDeskId: null, breaks: {short: settings.shortBreakCount, long: settings.longBreakCount, hourly: allowedBreakCount(settings, 'hourly')}, strikes: 0, blocked: false, canReport: true};
         pendingUserCreatesRef.current.add(String(newUser.id));
       }
       // Yeni hesap ayrı kimlikle eklenir; mevcut hesapların üstüne yazılmaz.
@@ -6835,7 +6961,7 @@ function MainApp() {
       const identityNo = createEightDigitCode(new Set(existing.map(u => String(u.identityNo || ''))));
       const newUser = {id, name, identityNo, specialCode, pin,
         pendingApproval: true, restrictionReason: 'Sorumlu onayı bekleniyor', restrictedUntil: 0,
-        activeDeskId: null, pendingDeskId: null, breaks: {short: settings.shortBreakCount, long: settings.longBreakCount},
+        activeDeskId: null, pendingDeskId: null, breaks: {short: settings.shortBreakCount, long: settings.longBreakCount, hourly: allowedBreakCount(settings, 'hourly')},
         strikes: 0, blocked: false, canReport: true};
       if (db) {
         await runTransaction(db, async tx => {
@@ -7993,8 +8119,9 @@ function MainApp() {
                         {myIsOnBreak && (
                           <div className="mt-4 bg-yellow-50 border border-yellow-200 rounded-xl p-5 flex flex-col items-center">
                             <Coffee className="w-10 h-10 text-yellow-600 mb-2" />
-                            <p className="text-yellow-800 font-bold mb-1 text-center">Mola Devam Ediyor</p>
-                            <div className="text-4xl font-mono font-black text-yellow-700 my-3 tracking-widest">{formatTime(myBreakEndTime - now)}</div>
+                            <p className="text-yellow-800 font-bold mb-1 text-center">{breakCountdown.kind === 'running' ? 'Mola Devam Ediyor' : breakCountdown.kind === 'expired' ? 'Mola Süresi Doldu' : 'Mola Süresi Doğrulanıyor'}</p>
+                            <div className="text-4xl font-mono font-black text-yellow-700 my-3 tracking-widest">{breakCountdown.kind === 'invalid' || !serverClockVerified ? '—:—' : formatTime(breakCountdown.remaining)}</div>
+                            {breakCountdown.kind !== 'running' && <p className="text-xs text-amber-800 mb-3 text-center">Masa sahipliği ve mola süresi sunucuyla eşitleniyor. Masanıza dönmek için QR okutabilirsiniz.</p>}
                             <button onClick={() => setScannerConfig({ isOpen: true, mode: 'return_break', title: 'Moladan Dönüş - Masa QR Doğrulaması' })} className="px-6 py-2 bg-yellow-200 hover:bg-yellow-300 text-yellow-800 font-bold rounded-full transition-colors flex items-center gap-2"><QrCode className="w-4 h-4" /> QR Okut ve Masaya Dön</button>
                           </div>
                         )}
@@ -8018,6 +8145,13 @@ function MainApp() {
                             <span className="font-black text-blue-700 bg-blue-200/50 px-3 py-1 rounded-lg">{myUserObj?.breaks?.long || 0} Kaldı</span>
                           </button>
 
+                          <button onClick={() => startBreak('hourly')} disabled={!isHourlyBreakAvailable(settings, now + serverTimeOffsetMs) || Number(myUserObj?.breaks?.hourly || 0) <= 0} className="w-full flex items-center justify-between p-4 bg-violet-50 hover:bg-violet-100 disabled:opacity-50 disabled:cursor-not-allowed border border-violet-200 rounded-2xl">
+                            <div className="flex items-center gap-3 text-violet-800">
+                              <div className="bg-violet-200 p-2 rounded-lg"><Clock className="w-5 h-5" /></div>
+                              <div className="text-left"><p className="font-bold">1 Saatlik Mola</p><p className="text-xs opacity-80">{settings.hourlyBreakDuration ?? 60} Dk · {isHourlyBreakAvailable(settings, now + serverTimeOffsetMs) ? 'Aktif' : 'Yalnızca cuma günü'}</p></div>
+                            </div>
+                            <span className="font-black text-violet-700 bg-violet-200/50 px-3 py-1 rounded-lg">{myUserObj?.breaks?.hourly || 0} Kaldı</span>
+                          </button>
                           <div className="h-4"></div>
                           <button onClick={releaseDesk} className="w-full flex items-center justify-center gap-2 p-4 bg-slate-800 hover:bg-slate-900 text-white font-bold rounded-2xl shadow-lg transition-all"><StopCircle className="w-5 h-5" /> Masayı Bırak / Çıkış Yap</button>
                         </div>
@@ -8548,6 +8682,9 @@ function MainApp() {
                         longBreakCount: parseInt(formData.get('longBreakCount')),
                         shortBreakDuration: parseInt(formData.get('shortBreakDuration')),
                         longBreakDuration: parseInt(formData.get('longBreakDuration')),
+                        hourlyBreakEnabled: formData.get('hourlyBreakEnabled') === 'on',
+                        hourlyBreakCount: Number(formData.get('hourlyBreakCount')),
+                        hourlyBreakDuration: Number(formData.get('hourlyBreakDuration')),
                         breakCooldown: Math.max(30, Number.isFinite(parseInt(formData.get('breakCooldown'))) ? parseInt(formData.get('breakCooldown')) : 30),
                         reportWaitTime: Number.isFinite(parseInt(formData.get('reportWaitTime'))) && parseInt(formData.get('reportWaitTime')) > 0 ? parseInt(formData.get('reportWaitTime')) : 5,
                         strikeLimit: Number.isFinite(parseInt(formData.get('strikeLimit'))) && parseInt(formData.get('strikeLimit')) > 0 ? parseInt(formData.get('strikeLimit')) : DEFAULT_SETTINGS.strikeLimit,
@@ -8555,6 +8692,13 @@ function MainApp() {
                         useCustomLayout: formData.get('useCustomLayout') === 'on'
                      };
 
+                     // Bozuk süre/limit kaydı molalarda sürekli sunucu uyarısı oluşturur.
+                     const countFields = ['shortBreakCount', 'longBreakCount', 'hourlyBreakCount'];
+                     const durationFields = ['shortBreakDuration', 'longBreakDuration', 'hourlyBreakDuration'];
+                     if (countFields.some(key => !Number.isSafeInteger(settingsPatch[key]) || settingsPatch[key] < 0 || settingsPatch[key] > 50) ||
+                         durationFields.some(key => !Number.isSafeInteger(settingsPatch[key]) || settingsPatch[key] < 1 || settingsPatch[key] > 240)) {
+                       return showMessage('Geçersiz Mola Ayarı', 'Mola hakları 0–50, süreler 1–240 dakika arasında tam sayı olmalıdır.', 'warning');
+                     }
                      systemSettingsSavingRef.current = true;
                      setSystemSettingsSaving(true);
                      try {
@@ -8576,7 +8720,7 @@ function MainApp() {
                          granularBaselineRef.current.settings = stableJson(next);
                          settingsRef.current = next;
                          setSettings(next);
-                         if (previousSettings.shortBreakCount !== next.shortBreakCount || previousSettings.longBreakCount !== next.longBreakCount) {
+                         if (previousSettings.shortBreakCount !== next.shortBreakCount || previousSettings.longBreakCount !== next.longBreakCount || previousSettings.hourlyBreakCount !== next.hourlyBreakCount || previousSettings.hourlyBreakEnabled !== next.hourlyBreakEnabled) {
                            for (const localUser of [...usersRef.current]) {
                              const user = db ? await runTransaction(db, async tx => {
                                const userRef = getLiveDoc('sgmUsers', localUser.id);
@@ -8658,6 +8802,13 @@ function MainApp() {
                         <div>
                           <label className="block text-xs font-semibold text-slate-600 mb-1">Uzun Süre (Dk)</label>
                           <input type="number" name="longBreakDuration" defaultValue={settings.longBreakDuration} className="w-full p-2 border border-slate-300 rounded-lg" />
+                        </div>
+                      </div>
+                      <div className="p-3 mt-3 border border-violet-200 rounded-xl bg-violet-50 space-y-2">
+                        <label className="flex items-center gap-2 text-sm font-bold"><input type="checkbox" name="hourlyBreakEnabled" defaultChecked={settings.hourlyBreakEnabled !== false} /> 1 Saatlik Mola (yalnızca cuma günü aktif)</label>
+                        <div className="grid grid-cols-2 gap-3">
+                          <label className="text-xs">Hak sayısı <input className="w-full p-2 border rounded-lg" type="number" min="0" max="50" name="hourlyBreakCount" defaultValue={settings.hourlyBreakCount ?? 1} /></label>
+                          <label className="text-xs">Süre (dakika) <input className="w-full p-2 border rounded-lg" type="number" min="1" max="240" name="hourlyBreakDuration" defaultValue={settings.hourlyBreakDuration ?? 60} /></label>
                         </div>
                       </div>
                       <div className="pt-3 border-t border-blue-200">

@@ -30,7 +30,9 @@ export function releasedDeskUserPatch(user, deskId) {
   const patch = {};
   if (realDesk(user.activeDeskId) && Number(user.activeDeskId) === Number(deskId)) {
     Object.assign(patch, { activeDeskId: null, activeDeskRole: null,
-      adminDeskOverrideDeskId: null, adminDeskOverrideSessionStart: null });
+      adminDeskOverrideDeskId: null, adminDeskOverrideSessionStart: null,
+    ...(user.lastBreakSession?.status === 'active' && Number(user.lastBreakSession.deskId) === Number(deskId)
+      ? { lastBreakSession: { ...user.lastBreakSession, status: 'admin_released' } } : {}) });
   }
   if (realDesk(user.pendingDeskId) && Number(user.pendingDeskId) === Number(deskId)) {
     Object.assign(patch, { pendingDeskId: null, pendingDeskDeadline: null });
@@ -47,7 +49,8 @@ export function deskNeedsClosing(desk) {
     desk.ownerDeviceId || desk.pendingDeviceId || desk.sessionStartTime ||
     desk.guestSessionStartTime || desk.breakEndTime || desk.guestBreakEndTime ||
     desk.reportEndTime || desk.guestReportEndTime || desk.guestReported ||
-    desk.reportIssuedAt || desk.guestReportIssuedAt || desk.reportVerifiedAt || desk.guestReportVerifiedAt);
+    desk.reportIssuedAt || desk.guestReportIssuedAt || desk.reportVerifiedAt || desk.guestReportVerifiedAt ||
+    desk.breakSessionId || desk.breakStartedAt || desk.breakOwnerId || desk.breakType || desk.breakDurationMinutes);
 }
 
 export function publicUser(user, id) {
