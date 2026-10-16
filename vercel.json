@@ -27,5 +27,11 @@
       "path": "/api/cron-close",
       "schedule": "0 19 * * *"
     }
+  ],
+  "rewrites": [
+    {
+      "source": "/api/version",
+      "destination": "/api/server-time?route=version"
+    }
   ]
 }
