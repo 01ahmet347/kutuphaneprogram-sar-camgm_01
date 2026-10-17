@@ -53,7 +53,10 @@ import { getFirestore, doc, setDoc, onSnapshot, runTransaction, collection, getD
 import { getMessaging, getToken, onMessage, isSupported as isMessagingSupported } from 'firebase/messaging';
 import { mergePendingRows, nonConflictingPatch, atomicFieldPatch, changedFields, mapLimited, sessionCanRestore } from './src/sync-core.js';
 import { preventClosedHoursSessionWrites } from './src/session-write-guard.js';
-import { withoutSessionWrites, isDeskOwnedByUser, safeBreakCountdown } from './src/authoritative-session.js';
+import { withoutSessionWrites, withoutAccountApprovalWrites, isDeskOwnedByUser, safeBreakCountdown } from './src/authoritative-session.js';
+import { requestStudentDesk } from './src/desk-request.js';
+import { isIstanbulAfterClose } from './src/closing-visibility.js';
+import { mergeAccountApproval } from './src/approval-merge.js';
 import { allowedBreakCount, allowedBreakDuration, isHourlyBreakAvailable, istanbulDayKey } from './src/break-policy.js';
 import { createCloudActions } from './src/cloud-transactions.js';
 import { APP_VERSION, BUILD_COMMIT } from './src/version.js';
@@ -1966,23 +1969,16 @@ function MainApp() {
   const cloudActions = createCloudActions({ db, runTransaction, ref: getLiveDoc,
     settings: () => settingsRef.current, dayKey: getLocalDayKey, isRestricted, lostDeskToday, applyViolationPolicy });
   const runStudentDeskAction = async (action, input = {}) => {
-    if (!fbUser) throw new Error('Öğrenci oturumu bulunamadı.');
-    const idToken = await fbUser.getIdToken();
-    const response = await fetch('/api/student-desk', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
-      body: JSON.stringify({ action, ...input })
+    if (!fbUser) throw new Error('Öğrenci oturumu bulunamadı. Tekrar giriş yapın.');
+    return requestStudentDesk({
+      action, input, getToken: forceRefresh => fbUser.getIdToken(forceRefresh)
     });
-    const payload = await response.json().catch(() => null);
-    if (!response.ok || payload?.ok !== true) {
-      throw new Error(payload?.message || `Masa servisi HTTP ${response.status} döndürdü.`);
-    }
-    if (payload.result === null) return null;
-    return payload;
   };
   const runAdminMaintenance = async (action, input = {}) => {
     if (!adminAuthorized || !auth?.currentUser) throw new Error('Yönetici yetkisi gerekli.');
-    await requireAdminForUserWrite();
+    // Onay işleminde ikinci bir zorunlu token yenileme turunu bekleme;
+    // gerçek yetki ve aktif yönetici oturumu yine API'de kontrol edilir.
+    if (action !== 'approve_users' && action !== 'approve_user') await requireAdminForUserWrite();
     const token = await auth.currentUser.getIdToken();
     const response = await fetch('/api/admin-maintenance', {
       method: 'POST',
@@ -2481,6 +2477,26 @@ function MainApp() {
     return job;
   };
 
+  // Anlık hesap onayı: tek güvenli sunucu transaction'ı, topluda tek ağ isteği.
+  // Eski yönetici önbelleği onay durumunu geriye çeviremez.
+  const approveUsersNow = async ids => {
+    if (!ids.length) return [];
+    const result = await runAdminMaintenance('approve_users', { userIds: ids.map(String) });
+    if (!Array.isArray(result?.users) || result.users.length !== ids.length) {
+      throw new Error('Hesap onayı sunucudan doğrulanamadı.');
+    }
+    // Yalnızca bu alanları birleştir; kısmi API yanıtını normalizeRemoteUsers
+    // üzerinden geçirmek GM kodunu, şifreyi ve ihlal sayacını değiştirebilir.
+    usersRef.current = mergeAccountApproval(usersRef.current, result.users);
+    for (const patch of result.users) {
+      const previous = granularBaselineRef.current.users.get(String(patch.id)) || {};
+      granularBaselineRef.current.users.set(String(patch.id), { ...previous, ...patch });
+    }
+    setUsers(usersRef.current);
+    try { localStorage.setItem('sgm_users', JSON.stringify(usersRef.current)); } catch {}
+    return result.users;
+  };
+
   const refreshStudentProfile = async () => {
     const id = currentUser?.id;
     if (!db || !id || auth?.currentUser?.uid !== id) return;
@@ -2514,6 +2530,42 @@ function MainApp() {
     };
   }, [currentUser?.id, fbUser]);
 
+  // 22:00'de açık öğrenci telefonunda eski masa bağlantısı kalmasın.
+  // Sunucuda da cezasız kapanış yapılır; bu kontrol yalnızca kendi oturumunu
+  // güvenli şekilde tamamlar ve Firestore'un onayladığı sonucu gösterir.
+  // Uyuyan sekme tekrar açıldığında veya bağlantı geldiğinde yeniden çalışır.
+  const studentCloseSyncRef = useRef({ busy: false, lastAttempt: 0, key: '' });
+  useEffect(() => {
+    if (!db || !fbUser || !currentUser?.id || fbUser.uid !== currentUser.id ||
+        !serverClockVerified || !navigator.onLine ||
+        !isIstanbulAfterClose(now + serverTimeOffsetMs)) return;
+    const deskId = Number(currentUser.activeDeskId || currentUser.pendingDeskId);
+    if (!Number.isInteger(deskId) || deskId < 1 || deskId > 35) return;
+    const action = currentUser.activeDeskId ? 'leave' : 'cancel';
+    const key = `${currentUser.id}:${deskId}:${action}`;
+    const guard = studentCloseSyncRef.current;
+    if (guard.busy || (guard.key === key && Date.now() - guard.lastAttempt < 20000)) return;
+    guard.busy = true; guard.key = key; guard.lastAttempt = Date.now();
+    (async () => {
+      try {
+        const result = await runStudentDeskAction(action, { deskId });
+        if (result) {
+          applyCloudRows(result);
+          if (!result.user?.activeDeskId && !result.user?.pendingDeskId) {
+            setSelectedDeskId(null); setDeskSelectionDeadline(null);
+            setScannerConfig({ isOpen: false, mode: null, title: '' });
+          }
+        }
+      } catch (error) {
+        // Cron ve onSnapshot diğer güvenli yollar; hata durumunda yerel kayıt
+        // sunucu onayı olmadan boşmuş gibi gösterilmez. Sonraki turda denenir.
+        console.warn('22:00 telefon masa eşitlemesi bekliyor:', error?.message);
+        await refreshStudentProfile();
+      } finally { guard.busy = false; }
+    })();
+  }, [currentUser?.id, currentUser?.activeDeskId, currentUser?.pendingDeskId,
+      fbUser?.uid, serverClockVerified, serverTimeOffsetMs, Math.floor(now / 5000)]);
+
   // Veri kapsamı sayfaya değil doğrulanmış yönetici oturumuna bağlıdır.
   const adminDataMode = adminAuthorized;
 
@@ -2542,7 +2594,7 @@ function MainApp() {
         const normalized = normalizeRemoteUsers(remoteRows, settingsRef.current);
         const merged = mergeRemoteWithPendingLocal('users', normalized, usersRef.current).map(row => {
           const remote = normalized.find(r => String(r.id) === String(row.id));
-          return remote ? { ...remote, ...withoutSessionWrites(row, 'users') } : row;
+          return remote ? { ...remote, ...withoutAccountApprovalWrites(withoutSessionWrites(row, 'users')) } : row;
         });
         // Tarayıcı önbelleği ile sunucu arasındaki farkı yalnızca bilgilendirme için tut.
         // Eksik hesapları kendiliğinden geri oluşturma: daha önce silinmiş olabilirler.
@@ -2709,7 +2761,9 @@ function MainApp() {
               ? mergeRemoteWithPendingLocal(key, remoteRows, getLocalRows()).map(row => {
                   const serverRow = remoteRows.find(remote => String(remote.id) === String(row.id));
                   if (!serverRow) return row;
-                  const allowedLocal = withoutSessionWrites(row, key);
+                  const allowedLocal = key === 'users'
+                    ? withoutAccountApprovalWrites(withoutSessionWrites(row, key))
+                    : withoutSessionWrites(row, key);
                   // Kritik alanların kaynağı yalnızca Firestore'dur.
                   return { ...serverRow, ...allowedLocal };
                 })
@@ -5089,6 +5143,7 @@ function MainApp() {
     return showMessage("İşlem Başarısız", "Bu masa şu anda kullanıma uygun değil. Her masa yalnızca bir öğrenci tarafından kullanılabilir.", "danger");
   };
 
+  const releaseDeskBusyRef = useRef(false);
   const releaseDesk = () => {
     if (!currentUser) return;
     const latestUser = usersRef.current.find(u => u.id === currentUser.id);
@@ -5114,11 +5169,16 @@ function MainApp() {
                         const nowTime = Date.now();
 
                         if (db) {
+                          if (releaseDeskBusyRef.current) return;
+                          releaseDeskBusyRef.current = true;
+                          setModal({ isOpen: true, type: 'info', title: 'Masa Bırakılıyor',
+                            content: 'İşlem sunucuda doğrulanıyor. Lütfen bekleyin; bağlantı kesilirse güvenli şekilde tekrar denenecek.' });
                           try {
                             const result = await runStudentDeskAction('leave', { deskId });
                             const leaveMode = result?.leaveMode || result?.mode;
                             const staleSession = leaveMode === 'stale_session_cleared';
                             const alreadyGone = leaveMode === 'already_not_here';
+                            const penaltyFree = result?.penaltyFree === true;
                             const returnedDesk = result?.desk || result?.desks?.find(d => Number(d.id) === Number(deskId));
                             if (!staleSession && !alreadyGone && !returnedDesk) {
                               throw new Error('Sunucu masa bırakma işleminin güncel masa kaydını döndürmedi. İşlem doğrulanamadı.');
@@ -5144,7 +5204,7 @@ function MainApp() {
                               releasedAt: result.at || nowTime,
                               expiresAt: (result.at || nowTime) + 45000
                             };
-                            if (!staleSession && !alreadyGone) {
+                            if (!staleSession && !alreadyGone && !penaltyFree) {
                               addLog('MASA_BIRAKILDI', `Masa ${deskId} isteyerek bırakıldı. Masa ve bekleyen rezervasyon kayıtları temizlendi.`, deskId, leavingUserId);
                               addLog('MASA_BEKLEME_BASLADI', 'Masa bırakıldı; 30 dakikalık yeniden masa alma bekleme süresi başladı.', deskId, leavingUserId);
                             }
@@ -5152,8 +5212,10 @@ function MainApp() {
                             setView('student_dash');
                             setTimeout(() => showMessage(
                               'Başarılı',
-                              staleSession
-                                ? 'Önceki günden kalan eski masa bağlantınız temizlendi. Yeni masa seçebilirsiniz; hesabınız açık kalır.'
+                              penaltyFree
+                                ? 'Kapanış saatinde masanız cezasız boşaltıldı. Hesabınız açık kalır.'
+                                : staleSession
+                                  ? 'Önceki günden kalan eski masa bağlantınız temizlendi. Yeni masa seçebilirsiniz; hesabınız açık kalır.'
                                 : alreadyGone
                                   ? 'Bu masa artık hesabınıza bağlı değil. Mevcut masa bilgileriniz güncellendi.'
                                   : leaveMode === 'desk_empty'
@@ -5164,6 +5226,8 @@ function MainApp() {
                           } catch (error) {
                             handleFirestoreQuotaError(error);
                             showMessage('Masa Bırakılamadı', error.message, 'warning');
+                          } finally {
+                            releaseDeskBusyRef.current = false;
                           }
                           return;
                         }
@@ -6301,9 +6365,7 @@ function MainApp() {
         if (!user) return showMessage('Hesap Bulunamadı', 'Kullanıcı artık listede bulunmuyor.', 'warning');
         pushUndoSnapshot('Hesap onayı ve kısıt kaldırma');
         try {
-          await saveAdminUserChanges(user, {...user, blocked: false, pendingApproval: false,
-            restrictedUntil: 0, restrictionReason: '', canReport: true,
-            reportPermissionPolicyVersion: 1, reportPermissionRestrictionUntil: 0});
+          await approveUsersNow([userId]);
           addLog('ADMIN_HESAP_ONAYLANDI', 'Hesap sorumlu tarafından onaylandı; hesap kısıtı kaldırıldı ve ihbar yetkisi açıldı.', null, userId);
           showMessage('Hesap Onaylandı', 'Onay sunucuya kaydedildi. Öğrenci ekranı güncel hesap durumunu alabilir.', 'success');
         } catch (error) {
@@ -7012,9 +7074,13 @@ function MainApp() {
 
     if (db) {
       try {
-        for (const desired of next.filter(u => ids.has(String(u.id)))) {
-          const original = current.find(u => u.id === desired.id);
-          await saveAdminUserChanges(original, desired);
+        if (action === 'unblock') {
+          await approveUsersNow([...ids]);
+        } else {
+          for (const desired of next.filter(u => ids.has(String(u.id)))) {
+            const original = current.find(u => u.id === desired.id);
+            await saveAdminUserChanges(original, desired);
+          }
         }
       } catch (error) {
         handleFirestoreQuotaError(error);

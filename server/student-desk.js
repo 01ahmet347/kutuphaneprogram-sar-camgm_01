@@ -38,7 +38,7 @@ export function createStudentDeskHandler({ authenticateStudent, createActions })
       // Kapanıştan sonra istekler ceza üretemez; cron masa oturumlarını cezasız kapatır.
       if (actions.closedNow?.()) {
         if (action === 'expire') return res.status(200).json({ ok: true, result: null });
-        if (action !== 'cancel') return res.status(409).json({ ok: false, error: 'library_closed', message: 'Kütüphane 22.00 itibarıyla kapalı.' });
+        if (action !== 'cancel' && action !== 'leave') return res.status(409).json({ ok: false, error: 'library_closed', message: 'Kütüphane 22.00 itibarıyla kapalı.' });
       }
       const input = { userId: uid, deskId: Number(deskId) };
       const result = action === 'expire'
@@ -52,6 +52,7 @@ export function createStudentDeskHandler({ authenticateStudent, createActions })
             leave: 'leaveDesk'
           }[action] || action]({
             ...input,
+            ...(action === 'leave' && actions.closedNow?.() ? { penaltyFree: true } : {}),
             ...(action === 'reserve' || action === 'claim' ? { deviceId } : {}),
             ...(action === 'claim' || action === 'break-end' || action === 'verify' ? { qrCode } : {}),
             ...(action === 'break-start' ? { type, requestId } : {}),
@@ -68,6 +69,7 @@ export function createStudentDeskHandler({ authenticateStudent, createActions })
         at: result.at,
         waitMinutes: result.waitMinutes,
         leaveMode: result.mode,
+        penaltyFree: result.penaltyFree === true,
         alreadyApplied: result.alreadyApplied === true,
         mode: result.mode,
         verified: result.verified === true,
@@ -75,7 +77,11 @@ export function createStudentDeskHandler({ authenticateStudent, createActions })
         eventId: result.eventId
       });
     } catch (error) {
-      if (error.code?.startsWith('firestore/') || error.code?.startsWith('app/') || error.code?.startsWith('auth/')) {
+      if (error.code?.startsWith('auth/')) {
+        return res.status(401).json({ ok: false, error: 'unauthenticated', message: 'Öğrenci oturumu doğrulanamadı. Yeniden giriş yapın.' });
+      }
+      if (error.code?.startsWith('firestore/') || error.code?.startsWith('app/') ||
+          /^(unavailable|deadline-exceeded|aborted|resource-exhausted|ETIMEDOUT|ECONNRESET)$/.test(String(error.code || ''))) {
         console.error('Student desk action error:', error.code);
         return res.status(503).json({ ok: false, error: 'desk_action_unavailable', message: 'Masa işlemi sunucuya kaydedilemedi. Bağlantıyı kontrol edip tekrar deneyin.' });
       }

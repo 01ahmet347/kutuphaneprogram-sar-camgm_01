@@ -624,7 +624,7 @@ export function createCloudActions({
         return { desk: nextDesk, user: nextUser, at };
       }),
 
-    leaveDesk: ({ userId, deskId }) =>
+    leaveDesk: ({ userId, deskId, penaltyFree = false }) =>
       runTransaction(db, async tx => {
         const [uSnap, dSnap, tombstone] = await Promise.all([
           tx.get(userRef(userId)),
@@ -750,11 +750,11 @@ export function createCloudActions({
           adminDeskOverrideSessionStart: linkedToRequestedDesk ? null : user.adminDeskOverrideSessionStart,
           pendingDeskId: preserveNewerAssignment ? user.pendingDeskId : null,
           pendingDeskDeadline: preserveNewerAssignment ? user.pendingDeskDeadline : null,
-          lastActiveTime: preserveNewerAssignment ? user.lastActiveTime : at,
-          deskReleasedAt: at,
-          deskReclaimAllowedAt: at + 30 * 60 * 1000,
-          deskReclaimDeskId: Number(deskId),
-          gmDeskAccessAt: preserveNewerAssignment ? user.gmDeskAccessAt : at
+          lastActiveTime: preserveNewerAssignment || penaltyFree ? user.lastActiveTime : at,
+          deskReleasedAt: penaltyFree ? user.deskReleasedAt || null : at,
+          deskReclaimAllowedAt: penaltyFree ? user.deskReclaimAllowedAt || 0 : at + 30 * 60 * 1000,
+          deskReclaimDeskId: penaltyFree ? user.deskReclaimDeskId || null : Number(deskId),
+          gmDeskAccessAt: preserveNewerAssignment || penaltyFree ? user.gmDeskAccessAt : at
         };
 
         tx.set(deskRef(deskId), nextDesk);
@@ -786,7 +786,7 @@ export function createCloudActions({
           changedDesks.push(cleanPending);
         }
 
-        return { desk: nextDesk, user: nextUser, desks: changedDesks, at, mode };
+        return { desk: nextDesk, user: nextUser, desks: changedDesks, at, mode, penaltyFree };
       }),
 
     assign: ({ userId, deskId }) =>

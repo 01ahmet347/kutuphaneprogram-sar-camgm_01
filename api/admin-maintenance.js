@@ -3,12 +3,15 @@ import { adminApp, dataCollection } from '../server/firebase-admin.js';
 import { requireActiveAdmin } from '../server/admin-session.js';
 import { createCloudActions } from '../src/cloud-transactions.js';
 import { getIstanbulDayKey } from '../server/student-desk.js';
+import { approveAccounts, validApprovalIds } from '../server/user-approval.js';
 
 export default async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store');
   if (req.method !== 'POST') return res.status(405).json({ ok: false });
-  const { action, userId, deskId } = req.body || {};
-  if (!['delete_user', 'expire'].includes(action) ||
+  const { action, userId, userIds, deskId } = req.body || {};
+  if (!['delete_user', 'expire', 'approve_user', 'approve_users'].includes(action) ||
+      action === 'approve_user' && !validApprovalIds([userId]) ||
+      action === 'approve_users' && !validApprovalIds(userIds) ||
       action === 'delete_user' && (typeof userId !== 'string' || !userId || userId.includes('/') || userId.length > 180) ||
       action === 'expire' && (!Number.isInteger(deskId) || deskId < 1 || deskId > 35)) {
     return res.status(400).json({ ok: false, message: 'Geçersiz işlem.' });
@@ -18,6 +21,14 @@ export default async function handler(req, res) {
     if (!token) return res.status(401).json({ ok: false });
     const admin = await getAuth(adminApp()).verifyIdToken(token);
     await requireActiveAdmin(admin);
+    if (action === 'approve_user' || action === 'approve_users') {
+      const ids = action === 'approve_user' ? [userId] : userIds;
+      const users = await approveAccounts({
+        ids, collection: dataCollection,
+        runTransaction: callback => dataCollection('sgmUsers').firestore.runTransaction(callback)
+      });
+      return res.status(200).json({ ok: true, result: { users } });
+    }
     const firestore = dataCollection('sgmDesks').firestore;
     const settings = (await dataCollection('sgmConfig').doc('settings').get()).data() || {};
     const dayKey = () => getIstanbulDayKey();
@@ -58,6 +69,9 @@ export default async function handler(req, res) {
     return res.status(200).json({ ok: true, result });
   } catch (error) {
     console.error('Admin maintenance error:', error.code || error.message);
-    return res.status(error.status || 503).json({ ok: false, message: 'Yönetici sunucu işlemi tamamlanamadı.' });
+    return res.status(error.status || 503).json({ ok: false, message:
+      error.status === 409 && (action === 'approve_user' || action === 'approve_users')
+        ? 'Seçilen kullanıcılardan biri bulunamadı veya silinmiş. Listeyi yenileyin.'
+        : 'Yönetici sunucu işlemi tamamlanamadı.' });
   }
 }

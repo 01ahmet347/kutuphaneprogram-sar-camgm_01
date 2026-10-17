@@ -34,3 +34,14 @@ export function safeBreakCountdown(desk, currentServerTime) {
   if (end <= currentServerTime) return { kind: 'expired', remaining: 0 };
   return { kind: 'running', remaining: end - currentServerTime };
 }
+
+// Server-authenticated approval must win over stale local administrator cache.
+export const ACCOUNT_PERMISSION_FIELDS = Object.freeze([
+  'blocked', 'pendingApproval', 'restrictedUntil', 'restrictionReason',
+  'canReport', 'reportPermissionPolicyVersion', 'reportPermissionRestrictionUntil'
+]);
+export function withoutAccountApprovalWrites(row) {
+  const clean = { ...row };
+  for (const field of ACCOUNT_PERMISSION_FIELDS) delete clean[field];
+  return clean;
+}
