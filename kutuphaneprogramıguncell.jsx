@@ -57,6 +57,7 @@ import { withoutSessionWrites, withoutAccountApprovalWrites, isDeskOwnedByUser, 
 import { requestStudentDesk } from './src/desk-request.js';
 import { isIstanbulAfterClose } from './src/closing-visibility.js';
 import { mergeAccountApproval } from './src/approval-merge.js';
+import { violationPolicyPatch, countRecentUnpardonedViolations } from './src/restriction-policy.js';
 import { allowedBreakCount, allowedBreakDuration, isHourlyBreakAvailable, istanbulDayKey } from './src/break-policy.js';
 import { createCloudActions } from './src/cloud-transactions.js';
 import { APP_VERSION, BUILD_COMMIT } from './src/version.js';
@@ -448,17 +449,7 @@ const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 const isRestricted = (user, at = Date.now()) => user?.blocked === true || user?.pendingApproval === true || Number(user?.restrictedUntil || 0) > at;
 const shouldRestoreReportPermission = (user, at = Date.now()) => Boolean(user) && !isRestricted(user, at) && user.canReport === false;
 const lostDeskToday = (user, deskId) => user?.lostDeskDate === getLocalDayKey() && (user?.lostDeskIds || []).includes(Number(deskId));
-const applyViolationPolicy = (user, deskId, at = Date.now()) => {
-  const history = [...(Array.isArray(user.violationHistory) ? user.violationHistory : []), at];
-  const recent = history.filter(t => Number(t) > at - WEEK_MS && Number(t) <= at);
-  return {
-    violationHistory: history,
-    restrictedUntil: recent.length >= 2 ? Math.max(Number(user.restrictedUntil || 0), at + WEEK_MS) : Number(user.restrictedUntil || 0),
-    restrictionReason: recent.length >= 2 ? 'Son 7 gün içinde iki ihlal: 7 gün kısıtlama' : (user.restrictionReason || ''),
-    lostDeskDate: getLocalDayKey(new Date(at)),
-    lostDeskIds: [...new Set([...(user.lostDeskDate === getLocalDayKey(new Date(at)) ? user.lostDeskIds || [] : []), Number(deskId)])]
-  };
-};
+const applyViolationPolicy = (user, deskId, at = Date.now()) => violationPolicyPatch(user, deskId, at, getLocalDayKey);
 
 const generateDefaultLayout = () => {
  const e=[]; let n=0;
@@ -2262,9 +2253,9 @@ function MainApp() {
         }
         const remote = baselineKey === 'users' ? normalizeRemoteUsers([snap.data()])[0] : normalizeRemoteDesks([snap.data()])[0] || snap.data();
         const fields = baselineKey === 'desks' ? ['status','occupant','ownerDeviceId','pendingOccupant','pendingDeskDeadline','pendingDeskRole','breakEndTime','reportEndTime','reportIssuedAt','reportVerifiedAt','sessionStartTime'] : ['activeDeskId','activeDeskRole','pendingDeskId','pendingDeskDeadline'];
-        const patch = withoutSessionWrites(preventClosedHoursSessionWrites(
+        const patch = withoutSessionWrites(withoutAccountApprovalWrites(preventClosedHoursSessionWrites(
           atomicFieldPatch(remote, previous, row, fields), baselineKey, Date.now(), settingsRef.current.openTime
-        ), baselineKey);
+        )), baselineKey);
         if (Object.keys(patch).length) tx.set(target, patch, { merge: true });
         return { ...remote, ...patch };
       });
@@ -2450,20 +2441,21 @@ function MainApp() {
       // Önceden sıraya alınmış yazmalar bu açık yönetici işlemini geri alamaz.
       await granularWriteChainRef.current.catch(() => {});
       const patch = Object.fromEntries(Object.entries(desired).filter(([key, value]) => key !== 'id' && stableJson(value) !== stableJson(original[key])));
-      // Hesap yetkileri tek bir tutarlı grup olarak yazılır.
-      for (const key of ['blocked', 'pendingApproval', 'restrictedUntil', 'restrictionReason', 'canReport']) {
-        if (desired[key] !== undefined) patch[key] = desired[key];
-      }
-      const result = db ? await runTransaction(db, async tx => {
-        const userRef = getLiveDoc('sgmUsers', original.id);
-        const tombstoneRef = getLiveDoc('sgmDeletedUsers', original.id);
-        const [snapshot, tombstone] = await Promise.all([tx.get(userRef), tx.get(tombstoneRef)]);
-        if (!snapshot.exists() || tombstone.exists()) throw new Error('Hesap silinmiş; eski kayıt yeniden oluşturulamaz.');
-        const remote = snapshot.data();
-        tx.set(userRef, patch, {merge: true});
-        // Masa, mola ve bildirim alanları sunucudaki güncel hâliyle korunur.
-        return {...remote, ...patch, id: original.id};
-      }) : desired;
+      // Yalnızca yönetici tarafından gerçekten değiştirilen alanları gönder.
+      // Ad/şifre düzenlemesi eski kısıt bilgisini istemeden geri yazamaz.
+      if (!Object.keys(patch).length) return original;
+      const result = db
+        ? (await runAdminMaintenance('update_user', {
+            userId: original.id,
+            patch,
+            expectedPermission: Object.fromEntries(
+              ['blocked', 'pendingApproval', 'restrictedUntil', 'restrictionReason',
+               'canReport', 'reportPermissionPolicyVersion', 'reportPermissionRestrictionUntil']
+                .map(key => [key, original[key]])
+            )
+          })).user
+        : desired;
+      if (!result) throw new Error('Hesap sunucuda güncellenemedi.');
       applyCloudRows({user: result});
       localStorage.setItem('sgm_users', JSON.stringify(usersRef.current));
       return result;
@@ -4133,7 +4125,9 @@ function MainApp() {
           (desksRef.current || []).some(d => Number(d.id) === Number(u.activeDeskId) &&
             Number(d.sessionStartTime) === Number(u.adminDeskOverrideSessionStart) && d.occupant === u.id))).map(u => u.id));
       const restrictedDeskIds = new Set((desksRef.current || []).filter(d => restrictedIds.has(d.occupant) || restrictedIds.has(d.pendingOccupant)).map(d => d.id));
-      if ((!db || adminAuthorized) && restrictedDeskIds.size) {
+      if (!db && restrictedDeskIds.size) {
+        // Canlı Firestore masa oturumlarını tarayıcıdaki geçici/eski kısıt verisiyle boşaltma.
+        // Sunucu işlemleri ve doğrulanmış masa zaman aşımı mevcut oturumu yönetir.
         (desksRef.current || []).filter(desk => restrictedDeskIds.has(desk.id)).forEach(desk => {
           const userId = desk.occupant || desk.pendingOccupant;
           addLog('HESAP_KISITI_MASA_BOSALTILDI', `Masa ${desk.id}, kullanıcı hesabının kısıtlanması nedeniyle boşaltıldı.`, desk.id, userId, false, null,
@@ -4182,6 +4176,10 @@ function MainApp() {
           }
 
           const deskUser = (Array.isArray(usersRef.current) ? usersRef.current : []).find(u => u.id === desk.occupant);
+          if (Number(deskUser?.restrictionClearedAt || 0) > 0 &&
+              Number(desk.reportIssuedAt || Number(desk.reportEndTime) - 300000) <= Number(deskUser.restrictionClearedAt)) {
+            return { ...desk, status: 'occupied', reportEndTime: null, reportIssuedAt: null, reportVerifiedAt: null };
+          }
           const currentStrikes = Number.isFinite(Number(deskUser?.strikes)) ? Number(deskUser.strikes) : 0;
           const strikeLimit = 1; // İlk ihlalde masa otomatik boşaltılır
           const newStrikes = currentStrikes + 1;
@@ -6352,7 +6350,10 @@ function MainApp() {
         if (userId) {
           const target = usersRef.current.find(u => u.id === userId);
           if (target && !isRestricted(target)) return showMessage('İhbar Yetkisi Açık', 'Kısıtsız hesaplarda boş masa ihbarı açıktır. Moladaki masa ihbar edilemez.', 'info');
-          setUsers(prev => Array.isArray(prev) ? prev.map(u => u.id === userId ? { ...u, canReport: u.canReport === false, reportPermissionPolicyVersion: 1, reportPermissionRestrictionUntil: Number(u.restrictedUntil || 0) } : u) : []);
+          const desired = { ...target, canReport: target.canReport === false,
+            reportPermissionPolicyVersion: 1, reportPermissionRestrictionUntil: Number(target.restrictedUntil || 0) };
+          try { await saveAdminUserChanges(target, desired); }
+          catch (error) { return showMessage('Yetki Güncellenemedi', error.message, 'warning'); }
           addLog('ADMIN_YETKI', `Kullanıcının ihbar yetkisi değiştirildi.`, null, userId);
         }
         break;
@@ -6498,7 +6499,7 @@ function MainApp() {
           </div>
         </div>
 
-        <p className="text-xs font-semibold text-slate-600">Son 7 gündeki ihlal: {(user.violationHistory || []).filter(t => t > Date.now()-WEEK_MS).length}</p>
+        <p className="text-xs font-semibold text-slate-600">Son 7 gündeki ihlal: {countRecentUnpardonedViolations(user)}</p>
         <form
           key={`admin-user-edit-${user.id}`}
           onSubmit={async (e) => {
@@ -7124,26 +7125,16 @@ function MainApp() {
     const restore = async () => {
       try {
         for (const candidate of candidates) {
-          const restoreTime = Date.now();
-          const patchFor = user => ({
-            canReport: true,
-            reportPermissionPolicyVersion: 1,
-            reportPermissionRestrictionUntil: Number(user.restrictedUntil || 0),
-            reportPermissionRestoredAt: restoreTime
-          });
-          const result = db ? await runTransaction(db, async tx => {
-            const userRef = getLiveDoc('sgmUsers', candidate.id);
-            const snapshot = await tx.get(userRef);
-            if (!snapshot.exists()) return null;
-            const user = { ...snapshot.data(), id: candidate.id };
-            if (!shouldRestoreReportPermission(user)) return null;
-            const patch = patchFor(user);
-            tx.set(userRef, patch, { merge: true });
-            return { ...user, ...patch };
-          }) : (() => {
-            const user = usersRef.current.find(u => u.id === candidate.id);
-            return user && shouldRestoreReportPermission(user) ? {...user, ...patchFor(user)} : null;
-          })();
+          const result = db
+            ? (await runAdminMaintenance('restore_report_permission', { userId: candidate.id })).user
+            : (() => {
+                const user = usersRef.current.find(u => u.id === candidate.id);
+                return user && shouldRestoreReportPermission(user)
+                  ? { ...user, canReport: true, reportPermissionPolicyVersion: 1,
+                      reportPermissionRestrictionUntil: Number(user.restrictedUntil || 0),
+                      reportPermissionRestoredAt: Date.now() }
+                  : null;
+              })();
           if (!result) continue;
           applyCloudRows({ user: result });
           addLog('ADMIN_IHBAR_YETKISI_ACILDI', 'Hesap kısıtı bulunmayan öğrencinin ihbar yetkisi açıldı.', null, result.id);

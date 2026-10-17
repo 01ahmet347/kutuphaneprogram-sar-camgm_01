@@ -4,6 +4,7 @@ import { adminApp, dataCollection } from '../server/firebase-admin.js';
 import { createStudentDeskHandler, getIstanbulDayKey } from '../server/student-desk.js';
 import { createCloudActions } from '../src/cloud-transactions.js';
 import { outsideLibraryHours } from '../server/daily-close.js';
+import { violationPolicyPatch } from '../src/restriction-policy.js';
 
 const handler = createStudentDeskHandler({
   async authenticateStudent(req) {
@@ -44,48 +45,8 @@ const handler = createStudentDeskHandler({
       user?.lostDeskDate === dayKey() &&
       (user?.lostDeskIds || []).includes(Number(deskId));
 
-    const applyViolationPolicy = (user, deskId, at) => {
-      const week = 7 * 24 * 60 * 60 * 1000;
-
-      const history = [
-        ...(Array.isArray(user.violationHistory)
-          ? user.violationHistory
-          : []),
-        at
-      ];
-
-      const recent = history.filter(
-        time => Number(time) > at - week && Number(time) <= at
-      );
-
-      return {
-        violationHistory: history,
-
-        restrictedUntil:
-          recent.length >= 2
-            ? Math.max(
-                Number(user.restrictedUntil || 0),
-                at + week
-              )
-            : Number(user.restrictedUntil || 0),
-
-        restrictionReason:
-          recent.length >= 2
-            ? 'Son 7 gün içinde iki ihlal: 7 gün kısıtlama'
-            : user.restrictionReason || '',
-
-        lostDeskDate: dayKey(new Date(at)),
-
-        lostDeskIds: [
-          ...new Set([
-            ...(user.lostDeskDate === dayKey(new Date(at))
-              ? user.lostDeskIds || []
-              : []),
-            Number(deskId)
-          ])
-        ]
-      };
-    };
+    const applyViolationPolicy = (user, deskId, at) =>
+      violationPolicyPatch(user, deskId, at, dayKey);
 
     const actions = createCloudActions({
       db: firestore,

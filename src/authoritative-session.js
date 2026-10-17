@@ -38,7 +38,8 @@ export function safeBreakCountdown(desk, currentServerTime) {
 // Server-authenticated approval must win over stale local administrator cache.
 export const ACCOUNT_PERMISSION_FIELDS = Object.freeze([
   'blocked', 'pendingApproval', 'restrictedUntil', 'restrictionReason',
-  'canReport', 'reportPermissionPolicyVersion', 'reportPermissionRestrictionUntil'
+  'canReport', 'reportPermissionPolicyVersion', 'reportPermissionRestrictionUntil',
+  'restrictionClearedAt'
 ]);
 export function withoutAccountApprovalWrites(row) {
   const clean = { ...row };

@@ -1040,6 +1040,17 @@ export function createCloudActions({
 
         const u = await tx.get(userRef(userId));
 
+        // Yönetici onayından ÖNCE başlatılan gecikmiş ihbar, onaydan sonra
+        // ceza verip yeni/aktif masa oturumunu düşüremez.
+        if (mode === 'report_timeout' && snapshotExists(u) &&
+            Number(u.data().restrictionClearedAt || 0) > 0 &&
+            Number(desk.reportIssuedAt || Number(deadline) - 300000) <= Number(u.data().restrictionClearedAt)) {
+          const after = { ...desk, status: 'occupied', reportEndTime: null,
+            reportIssuedAt: null, reportVerifiedAt: null };
+          tx.set(deskRef(deskId), after);
+          return { desk: after, user: u.data(), verified: true, mode: 'approval_grace', at };
+        }
+
         if (mode === 'report_timeout' &&
             Number(desk.reportIssuedAt || Number(deadline) - 300000) < lastClosingAt(at)) {
           // A late cleanup must not convert a report cancelled at closing into a penalty.

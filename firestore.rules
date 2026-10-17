@@ -50,6 +50,16 @@ service cloud.firestore {
       ]);
     }
 
+    // Yetkileri yalnızca yönetici token'ını doğrulayan sunucu API'si yazar.
+    // Gecikmiş bir yönetici sekmesi veya yerel senkron işlemi onayı geri alamaz.
+    function userAccountPermissionMutation() {
+      return request.resource.data.diff(resource.data).affectedKeys().hasAny([
+        'blocked', 'pendingApproval', 'restrictedUntil', 'restrictionReason',
+        'canReport', 'reportPermissionPolicyVersion', 'reportPermissionRestrictionUntil',
+        'reportPermissionRestoredAt', 'restrictionClearedAt'
+      ]);
+    }
+
     match /artifacts/{appId}/public/data/sgmDesks/{deskId} {
       allow read: if signedIn();
       allow create: if isAdminFor(appId) &&
@@ -63,7 +73,7 @@ service cloud.firestore {
       allow get: if isAdminFor(appId) || isStudent(userId);
       allow list: if isAdminFor(appId);
       allow create, delete: if isAdminFor(appId);
-      allow update: if isAdminFor(appId) && !userSessionMutation();
+      allow update: if isAdminFor(appId) && !userSessionMutation() && !userAccountPermissionMutation();
     }
 
     match /artifacts/{appId}/public/data/sgmMessages/{userId} {
