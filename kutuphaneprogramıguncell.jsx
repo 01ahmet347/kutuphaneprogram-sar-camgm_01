@@ -61,6 +61,7 @@ import { violationPolicyPatch, countRecentUnpardonedViolations } from './src/res
 import { allowedBreakCount, allowedBreakDuration, isHourlyBreakAvailable, istanbulDayKey } from './src/break-policy.js';
 import { createCloudActions } from './src/cloud-transactions.js';
 import { APP_VERSION, BUILD_COMMIT } from './src/version.js';
+import { currentApplePushInstallGuidance, isAppleMobileDevice } from './src/pwa-support.js';
 
 let app, auth, db, appId;
 let tabAuthPersistenceReady = Promise.resolve(null);
@@ -2896,6 +2897,9 @@ function MainApp() {
 
   const registerPhonePush = async (userId, force = false) => {
     if (!userId) return null;
+    // iOS Safari sekmelerinde Web Push desteklenmez: mevcut push kaydını/sunucu
+    // kullanıcı durumunu değiştirmeden yalnız Ana Ekran kurulumunu göster.
+    if (currentApplePushInstallGuidance()) return null;
 
     const markStage = (stage, extra = {}) => {
       updateUserPushDebug(userId, {
@@ -2938,6 +2942,23 @@ function MainApp() {
       if (pushRegistrationRef.current.working && !force) {
         markStage('2_onceki_kayit_devam_ediyor');
         return pushRegistrationRef.current.token || null;
+      }
+
+      // iOS yalnızca Ana Ekran uygulamasında ve doğrudan kullanıcı dokunuşunda
+      // izin penceresini açar. Firebase async destek testinden ÖNCE iste.
+      // Android/masaüstü eski izin sırası korunur.
+      const iosHomeApp = isAppleMobileDevice({
+        userAgent: navigator.userAgent || '',
+        platform: navigator.platform || '',
+        maxTouchPoints: navigator.maxTouchPoints || 0
+      });
+      if (iosHomeApp && force && 'Notification' in window && Notification.permission === 'default') {
+        markStage('4_ios_bildirim_izni_isteniyor');
+        try {
+          await Notification.requestPermission();
+        } catch (error) {
+          return fail('4_ios_bildirim_izni_hatasi', 'iPhone bildirim izni alınamadı.', error);
+        }
       }
 
       markStage('2_fcm_destegi_kontrol_ediliyor');
@@ -3250,6 +3271,11 @@ function MainApp() {
   };
 
   const retryMyPhonePushRegistration = async () => {
+    const appleInstallMessage = currentApplePushInstallGuidance();
+    if (appleInstallMessage) {
+      showMessage('iPhone Bildirim Kurulumu', appleInstallMessage, 'warning');
+      return;
+    }
     if (!currentUser?.id) {
       showMessage(
         'Öğrenci Girişi Gerekli',
@@ -8086,6 +8112,11 @@ function MainApp() {
             </nav>
 
             <main className="flex-1 max-w-5xl mx-auto w-full p-4 lg:p-6 space-y-6">
+              {currentApplePushInstallGuidance() && (
+                <div role="note" className="p-4 bg-blue-50 border border-blue-200 text-blue-900 rounded-2xl text-sm">
+                  <b>iPhone bildirimlerini açmak için:</b> {currentApplePushInstallGuidance()}
+                </div>
+              )}
               {studentRestricted && <div className="p-4 bg-amber-50 border border-amber-200 text-amber-900 rounded-2xl"><b>Hesabınız kısıtlı.</b> Masa seçimi, boş masa ihbarı ve dilek / şikayet kapalıdır. {myUserObj?.restrictionReason} Kütüphane sorumlusu gerekli kontrollerden sonra kısıtı kaldırabilir.<button onClick={refreshStudentProfile} className="block mt-2 px-3 py-2 bg-white border border-amber-300 rounded-lg font-bold">Hesap Durumunu Yenile</button></div>}
               {!studentRestricted && studentDeskWait > 0 && <div className="p-4 bg-blue-50 border border-blue-200 text-blue-900 rounded-2xl"><b>Yalnızca Masa {myUserObj?.deskReclaimDeskId} için kalan bekleme: {formatTime(studentDeskWait)}</b><p>Diğer uygun masaları hemen seçebilirsiniz. Yönetici istisna uygulayabilir.</p></div>}
               {registrationResult && myUserObj?.pendingApproval && <div className="p-4 bg-white border rounded-2xl space-y-2"><p><b>GM özel kodunu yazmayı unutmayın:</b> {myUserObj.specialCode}</p><button disabled={registrationRedirectBusy} onClick={openRegistrationGoogleForm} className="p-3 bg-green-600 text-white rounded-xl">Kayıt formunu aç</button></div>}

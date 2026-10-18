@@ -1,0 +1,26 @@
+{
+  "id": "/",
+  "name": "SGM Kütüphane",
+  "short_name": "SGM Kütüphane",
+  "description": "SGM Kütüphane masa ve mola takibi, duyurular ve bildirimler.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#0f172a",
+  "lang": "tr",
+  "icons": [
+    {
+      "src": "/icons/sgm-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icons/sgm-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
