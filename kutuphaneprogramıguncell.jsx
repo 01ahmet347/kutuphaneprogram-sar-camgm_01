@@ -56,13 +56,13 @@ import { preventClosedHoursSessionWrites } from './src/session-write-guard.js';
 import { withoutSessionWrites, withoutAccountApprovalWrites, isDeskOwnedByUser, safeBreakCountdown } from './src/authoritative-session.js';
 import { requestStudentDesk } from './src/desk-request.js';
 import { isIstanbulAfterClose } from './src/closing-visibility.js';
-import { hasCurrentOwnerSession, hasPreviousClosingSession } from './src/desk-day-safety.js';
 import { mergeAccountApproval } from './src/approval-merge.js';
 import { violationPolicyPatch, countRecentUnpardonedViolations } from './src/restriction-policy.js';
 import { allowedBreakCount, allowedBreakDuration, isHourlyBreakAvailable, istanbulDayKey } from './src/break-policy.js';
 import { createCloudActions } from './src/cloud-transactions.js';
 import { APP_VERSION, BUILD_COMMIT } from './src/version.js';
 import { currentApplePushInstallGuidance, isAppleMobileDevice } from './src/pwa-support.js';
+import { expiredBreakDetails } from './src/break-expiry-audit.js';
 
 let app, auth, db, appId;
 let tabAuthPersistenceReady = Promise.resolve(null);
@@ -727,18 +727,12 @@ const DynamicKrokiMap = ({ desks, layoutElements, onDeskClick, myDeskId, isPubli
           {visibleLayoutElements.map(el => {
               if (el.type === 'desk') {
                   const desk = getDesk(el.deskId);
-                  // Öğrenci/kamu krokisinde eski veya tarihi belirsiz oturum
-                  // aktif mola gibi gösterilmez. Veritabanı kaydı burada değiştirilmez.
-                  const unverifiedSession = !!(desk && !isAdmin && desk.occupant &&
-                    ['occupied', 'on_break', 'reported'].includes(desk.status) &&
-                    !hasCurrentOwnerSession(desk, Date.now()));
 
                   let statusClasses = 'bg-slate-200 text-slate-400 border-slate-300 opacity-60';
                   if (desk) {
                       const isMyDesk = desk.id === myDeskId;
                       const isReserved = !!(desk.pendingOccupant && Number(desk.pendingDeskDeadline || 0) > Date.now());
-                      if (unverifiedSession) statusClasses = 'bg-slate-300 text-slate-700 border-slate-500';
-                      else if (isMyDesk) statusClasses = 'bg-blue-600 text-white border-blue-700 shadow-lg ring-2 ring-blue-300 z-10 scale-110';
+                      if (isMyDesk) statusClasses = 'bg-blue-600 text-white border-blue-700 shadow-lg ring-2 ring-blue-300 z-10 scale-110';
                       else if (isReserved) statusClasses = 'bg-purple-500 text-white border-purple-700 shadow-md';
                       else if (desk.status === 'available') statusClasses = 'bg-white text-slate-700 hover:bg-slate-50 border-slate-400';
                       else if (desk.status === 'occupied') statusClasses = 'bg-red-500 text-white border-red-700 hover:bg-red-600';
@@ -750,15 +744,15 @@ const DynamicKrokiMap = ({ desks, layoutElements, onDeskClick, myDeskId, isPubli
                       <button
                         key={el.id}
                         onClick={() => desk && onDeskClick && onDeskClick(desk)}
-                        disabled={isPublic || unverifiedSession || (desk && !isAdmin && desk.status === 'disabled')}
+                        disabled={isPublic || (desk && !isAdmin && desk.status === 'disabled')}
                         style={{ left: el.x, top: el.y, width: el.w, height: el.h }}
                         className={`absolute flex flex-col items-center justify-center font-bold border transition-all ${statusClasses} ${!isPublic && desk && 'cursor-pointer'} ${isPublic && 'cursor-default'}`}
                       >
                         {el.chair && <span aria-hidden="true" style={{position:'absolute',background:'#334155',borderRadius:8,width:['left','right'].includes(el.chair)?20:42,height:['left','right'].includes(el.chair)?42:20,...(el.chair==='left'?{left:-22,top:'22%'}:el.chair==='right'?{right:-22,top:'22%'}:el.chair==='top'?{top:-22,left:'32%'}:{bottom:-22,left:'32%'})}}/>}
                         <span className="text-base sm:text-lg leading-none">{el.deskId}</span>
-                        {desk && (unverifiedSession || isPublic || (desk.pendingOccupant && Number(desk.pendingDeskDeadline || 0) > Date.now())) && (
+                        {desk && (isPublic || (desk.pendingOccupant && Number(desk.pendingDeskDeadline || 0) > Date.now())) && (
                             <span className="text-[9px] uppercase opacity-90 mt-0.5 leading-none tracking-tighter">
-                                {unverifiedSession ? 'DOĞRULANIYOR' : (desk.pendingOccupant && Number(desk.pendingDeskDeadline || 0) > Date.now()) ? 'REZERVE' : desk.status === 'available' ? 'BOŞ' : desk.status === 'occupied' ? 'DOLU' : desk.status === 'on_break' ? 'MOLA' : desk.status === 'reported' ? 'KONTROL' : 'KAPALI'}
+                                {(desk.pendingOccupant && Number(desk.pendingDeskDeadline || 0) > Date.now()) ? 'REZERVE' : desk.status === 'available' ? 'BOŞ' : desk.status === 'occupied' ? 'DOLU' : desk.status === 'on_break' ? 'MOLA' : desk.status === 'reported' ? 'KONTROL' : 'KAPALI'}
                             </span>
                         )}
                       </button>
@@ -3652,25 +3646,6 @@ function MainApp() {
     if (!currentUser) restoredLoginLoggedRef.current = false;
   }, [isDataLoaded, currentUser?.id, fbUser, settings, desks]);
 
-  // Öğrenci girişinde de eski günün kesinleşmiş masa kayıtları sunucu tarafından
-  // CEZASIZ temizlenir. Kişi/PIN/QR/ihlal kayıtlarına dokunulmaz.
-  const studentMorningRecoveryRef = useRef({ busy: false, completedDay: '', attempt: 0 });
-  useEffect(() => {
-    if (!db || !isDataLoaded || !granularSeenRemoteRef.current.desks || !fbUser || !currentUser?.id ||
-        fbUser.uid !== currentUser.id || adminAuthorized || !navigator.onLine) return;
-    // Her öğrencinin açılışında gereksiz 35 masa sorgusu yapma: önce
-    // sunucudan gelen masalarda önceki güne ait kesinleşmiş oturum ara.
-    if (!desksRef.current.some(desk => hasPreviousClosingSession(desk, Date.now()))) return;
-    const day = getLocalDayKey();
-    const guard = studentMorningRecoveryRef.current;
-    if (guard.busy || guard.completedDay === day || Date.now() - guard.attempt < 30 * 1000) return;
-    guard.busy = true; guard.attempt = Date.now();
-    runStudentDeskAction('recover-stale')
-      .then(() => { guard.completedDay = day; })
-      .catch(error => console.warn('Sabah masa güvenliği tekrar denenecek:', error?.message))
-      .finally(() => { guard.busy = false; });
-  }, [isDataLoaded, fbUser?.uid, currentUser?.id, adminAuthorized, desks, Math.floor(now / 30000)]);
-
   // Son kapanıştan önce başlamış oturumları açılışta yakala. İşlem sunucudaki
   // güncel masa ve kullanıcıları tekrar okuyarak yeni günün masalarını korur.
   // Sunucu cron'u yerine geçmez: çevrimiçi temizlik için yönetici oturumu gerekir.
@@ -5636,7 +5611,6 @@ function MainApp() {
     const safeDesks = Array.isArray(desks) ? desks : [];
     const desk = safeDesks.find(d => Number(d.id) === Number(deskId));
     if(!desk) return showMessage("Uyarı", "Masa bulunamadı.", "warning");
-    if (desk.occupant && !hasCurrentOwnerSession(desk, Date.now())) return showMessage('Masa Kontrol Ediliyor', 'Bu masa oturumunun bugüne ait olduğu doğrulanamadı. Haksız ihbar önlemek için işlem kapalı.', 'info');
     if (desk.status === 'on_break' && Number(desk.breakEndTime || 0) > Date.now()) return showMessage('Masa Molada', 'Resmî mola süresi bitmeden masa ihbar edilemez.', 'info');
     if(desk.status === 'disabled' || !desk.occupant) return showMessage("Uyarı", "Bu masada ihbar edilebilecek aktif kullanıcı bulunmuyor.", "warning");
     if(deskId === currentUser.activeDeskId) return showMessage("Uyarı", "Kendi bulunduğunuz masadaki kişileri ihbar edemezsiniz.", "warning");
@@ -5691,8 +5665,7 @@ function MainApp() {
     identityNo = registeredReporter.specialCode;
     const reportedDesk = (desksRef.current || []).find(d => Number(d.id) === Number(deskId));
     const occupantId = targetRole === 'guest' ? reportedDesk?.guestOccupant : reportedDesk?.occupant;
-    if (!reportedDesk || (targetRole === 'owner' && !hasCurrentOwnerSession(reportedDesk, Date.now())) ||
-        !occupantId || occupantId !== targetUserId || occupantId === freshReporter.id ||
+    if (!reportedDesk || !occupantId || occupantId !== targetUserId || occupantId === freshReporter.id ||
         reportedDesk.status === 'disabled' || (targetRole === 'owner' && (reportedDesk.status === 'reported' ||
           (reportedDesk.status === 'on_break' && Number(reportedDesk.breakEndTime || 0) > Date.now()))) ||
         (targetRole === 'guest' && (reportedDesk.guestReported || Number(reportedDesk.guestBreakEndTime || 0) > Date.now()))) {
@@ -6862,6 +6835,29 @@ function MainApp() {
   const breakCountdown = myIsGuest
     ? safeBreakCountdown({breakEndTime: myBreakEndTime}, now + serverTimeOffsetMs)
     : safeBreakCountdown(myDesk, now + serverTimeOffsetMs);
+  // Süre 00:00 olduğunda sunucu masanın HALA molada olduğunu yeniden doğrular.
+  // Sistem kaydı tekrar girildiğinde çoğalmaz; QR dönüşü/aktif oturum değişmez.
+  // Öğrenci uygulaması tamamen kapalıysa istemci kontrol yapamaz.
+  const expiredBreak = expiredBreakDetails({
+    desk: myDesk, userId: currentUser?.id, activeDeskId: myUserObj?.activeDeskId,
+    isGuest: myIsGuest, at: now + serverTimeOffsetMs, clockVerified: serverClockVerified
+  });
+  const breakExpiryAttemptsRef = useRef(new Map());
+  useEffect(() => {
+    if (view !== 'student_dash' || !isDataLoaded || !fbUser || adminAuthorized || !expiredBreak) return;
+    const key = `${expiredBreak.userId}:${expiredBreak.deskId}:${expiredBreak.isGuest}:${expiredBreak.endAt}`;
+    const previous = breakExpiryAttemptsRef.current.get(key);
+    if (previous === 'done' || typeof previous === 'number' && Date.now() - previous < 15000) return;
+    breakExpiryAttemptsRef.current.set(key, Date.now());
+    runStudentActivity('break-expired', { deskId: expiredBreak.deskId })
+      .then(result => {
+        if (result?.saved || result?.reason === 'not_expired_or_returned') {
+          breakExpiryAttemptsRef.current.set(key, 'done');
+        }
+      })
+      .catch(() => { /* Ağ kesilirse sonraki kontrolde yeniden denenir. */ });
+  }, [view, isDataLoaded, fbUser?.uid, adminAuthorized, expiredBreak?.endAt, expiredBreak?.deskId, Math.floor(now / 15000)]);
+
   const breakRepairAttemptRef = useRef(new Set());
   useEffect(() => {
     const last = myUserObj?.lastBreakSession;
@@ -8237,7 +8233,13 @@ function MainApp() {
                             <Coffee className="w-10 h-10 text-yellow-600 mb-2" />
                             <p className="text-yellow-800 font-bold mb-1 text-center">{breakCountdown.kind === 'running' ? 'Mola Devam Ediyor' : breakCountdown.kind === 'expired' ? 'Mola Süresi Doldu' : 'Mola Süresi Doğrulanıyor'}</p>
                             <div className="text-4xl font-mono font-black text-yellow-700 my-3 tracking-widest">{breakCountdown.kind === 'invalid' || !serverClockVerified ? '—:—' : formatTime(breakCountdown.remaining)}</div>
-                            {breakCountdown.kind !== 'running' && <p className="text-xs text-amber-800 mb-3 text-center">Masa sahipliği ve mola süresi sunucuyla eşitleniyor. Masanıza dönmek için QR okutabilirsiniz.</p>}
+                            {breakCountdown.kind === 'expired' && serverClockVerified && (
+                              <div role="alert" className="w-full bg-amber-100 border-2 border-amber-400 rounded-xl p-3 mb-3 text-center">
+                                <p className="font-black text-amber-900">Mola süreniz doldu, lütfen masanıza dönünüz!</p>
+                                <p className="text-sm text-amber-800 mt-1">Masanızın QR kodunu okutarak dönüşünüzü doğrulayınız.</p>
+                              </div>
+                            )}
+                            {(breakCountdown.kind === 'invalid' || !serverClockVerified) && <p className="text-xs text-amber-800 mb-3 text-center">Masa sahipliği ve mola süresi sunucuyla eşitleniyor. Masanıza dönmek için QR okutabilirsiniz.</p>}
                             <button onClick={() => setScannerConfig({ isOpen: true, mode: 'return_break', title: 'Moladan Dönüş - Masa QR Doğrulaması' })} className="px-6 py-2 bg-yellow-200 hover:bg-yellow-300 text-yellow-800 font-bold rounded-full transition-colors flex items-center gap-2"><QrCode className="w-4 h-4" /> QR Okut ve Masaya Dön</button>
                           </div>
                         )}

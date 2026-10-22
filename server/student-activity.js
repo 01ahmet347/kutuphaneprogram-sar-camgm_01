@@ -1,3 +1,6 @@
+import { createHash } from 'node:crypto';
+import { expiredBreakDetails } from '../src/break-expiry-audit.js';
+
 const STUDENT_EVENT_PREFIXES = [
   'SISTEM_GIRIS',
   'PIL_AYARI_BILGILENDIRME',
@@ -16,7 +19,7 @@ const STUDENT_EVENT_PREFIXES = [
   'UYGULAMA_'
 ];
 
-export function createStudentActivityHandler({ authenticateStudent, saveFeedback, savePushToken, saveAuditEvent }) {
+export function createStudentActivityHandler({ authenticateStudent, saveFeedback, savePushToken, saveAuditEvent, saveBreakExpiryEvent }) {
   return async function studentActivityHandler(req, res) {
     res.setHeader('Cache-Control', 'no-store');
     if (req.method !== 'POST') {
@@ -46,6 +49,11 @@ export function createStudentActivityHandler({ authenticateStudent, saveFeedback
           return res.status(400).json({ ok: false, error: 'invalid_push_token' });
         }
         result = await savePushToken(uid, body.token);
+      } else if (body.action === 'break-expired') {
+        if (!Number.isInteger(body.deskId) || body.deskId < 1 || body.deskId > 35) {
+          return res.status(400).json({ ok: false, error: 'invalid_desk' });
+        }
+        result = await saveBreakExpiryEvent(uid, body.deskId);
       } else if (body.action === 'audit-event') {
         const record = body.record;
         if (!record || typeof record !== 'object' || Array.isArray(record) ||
@@ -92,6 +100,43 @@ export function createStudentProfileWriters({ dataCollection, now = Date.now }) 
   };
 
   return {
+    // Salt ekleme: masa, mola, kullanıcı, ceza veya push alanlarını değiştirmez.
+    async saveBreakExpiryEvent(uid, deskId) {
+      const deskRef = dataCollection('sgmDesks').doc(String(deskId));
+      return deskRef.firestore.runTransaction(async tx => {
+        const [student, deskSnap] = await Promise.all([requireStudent(tx, uid), tx.get(deskRef)]);
+        if (!deskSnap.exists) return { saved: false, reason: 'not_expired_or_returned' };
+        const user = student.user;
+        const desk = { ...deskSnap.data(), id: deskId };
+        const at = now();
+        const isGuest = user.activeDeskRole === 'guest' &&
+          String(desk.guestOccupant || '') === String(uid);
+        const details = expiredBreakDetails({
+          desk, userId: uid, activeDeskId: user.activeDeskId, isGuest, at
+        });
+        if (!details) return { saved: false, reason: 'not_expired_or_returned' };
+        // İçerik sunucu tarafından oluşturulur; istemci ceza veya log metni göndermez.
+        const digest = createHash('sha256')
+          .update(`${uid}|${deskId}|${isGuest}|${details.endAt}`).digest('hex').slice(0, 32);
+        const id = `MOLA-BITIS-DONUS-YOK-${digest}`;
+        const auditRef = dataCollection('sgmAudit').doc(id);
+        const deletedRef = dataCollection('sgmDeletedRecords').doc(`logs-${id}`);
+        const [existing, deleted] = await Promise.all([tx.get(auditRef), tx.get(deletedRef)]);
+        if (deleted.exists) return { saved: false, reason: 'deleted' };
+        if (existing.exists) return { saved: true, deduplicated: true, id };
+        tx.create(auditRef, {
+          id, time: at, breakEndAt: details.endAt, deskId, userId: uid,
+          type: 'MOLA_SURESI_DOLDU_DONUS_YAPILMADI',
+          message: `Masa ${deskId}: Mola süresi 00:00 oldu. Kontrol anında öğrenci henüz QR koduyla masaya dönüş yapmamıştı. Otomatik ihlal uygulanmadı.`,
+          userInfo: `${String(user.name || '')}${user.specialCode ? ` (GM: ${user.specialCode})` : ''}`,
+          actorId: 'SYSTEM', actorInfo: 'Sistem - doğrulanmış mola kontrolü',
+          actorFirebaseUid: uid, deviceInfo: String(user.deviceId || ''),
+          guest: isGuest
+        });
+        return { saved: true, deduplicated: false, id };
+      });
+    },
+
     async saveFeedback(uid, { id, type, message }) {
       const ref = dataCollection('sgmFeedback').doc(id);
       const users = dataCollection('sgmUsers');
