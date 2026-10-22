@@ -127,7 +127,7 @@ test('student report and presence verification are transactional and scoped to a
   const db=memoryDatabase({
     'sgmUsers/reporter':{...user('reporter'),activeDeskId:2,canReport:true,name:'R'},
     'sgmUsers/target':{...user('target'),activeDeskId:1,name:'T',specialCode:'12345678'},
-    'sgmDesks/1':{...desk(1),status:'occupied',occupant:'target',sessionStartTime:950},
+    'sgmDesks/1':{...desk(1),status:'occupied',occupant:'target'},
     'sgmDesks/2':{...desk(2),status:'occupied',occupant:'reporter'}
   });
   const api=actions(db);
@@ -179,7 +179,7 @@ test('break timeout never penalizes, report timeout is idempotent',async()=>{
   assert.equal(await api.expireDesk(1),null);
   assert.equal(db.data.get('sgmUsers/a').strikes,0);
   assert.equal(db.data.get('sgmDesks/1').status,'on_break');
-  db.data.set('sgmDesks/1',{...desk(1),status:'reported',occupant:'a',sessionStartTime:950,reportIssuedAt:500,reportEndTime:900});
+  db.data.set('sgmDesks/1',{...desk(1),status:'reported',occupant:'a',reportIssuedAt:500,reportEndTime:900});
   const results=await Promise.all([api.expireDesk(1),api.expireDesk(1)]);
   assert.equal(results.filter(Boolean).length,1);
   assert.equal(db.data.get('sgmUsers/a').strikes,1);
@@ -284,7 +284,7 @@ test('an expired break can be reported and has precisely five minutes to verify'
   const db = memoryDatabase({
     'sgmUsers/reporter': { ...user('reporter'), activeDeskId: 2, canReport: true },
     'sgmUsers/target': { ...user('target'), activeDeskId: 1 },
-    'sgmDesks/1': { ...desk(1), status: 'on_break', occupant: 'target', sessionStartTime: 950, breakEndTime: 900 },
+    'sgmDesks/1': { ...desk(1), status: 'on_break', occupant: 'target', breakEndTime: 900 },
     'sgmDesks/2': { ...desk(2), status: 'occupied', occupant: 'reporter' }
   });
   const api = actions(db);

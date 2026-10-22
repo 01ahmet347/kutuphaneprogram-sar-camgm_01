@@ -1,6 +1,5 @@
 import { releaseUserFromDesk, json } from './sync-core.js';
 import { allowedBreakDuration, dailyBreakState, isHourlyBreakAvailable } from './break-policy.js';
-import { hasCurrentOwnerSession } from './desk-day-safety.js';
 
 // Web SDK: exists()
 // Admin SDK: exists
@@ -527,8 +526,7 @@ export function createCloudActions({
           !(desk.status === 'occupied' ||
             (desk.status === 'on_break' && Number(desk.breakEndTime || 0) <= at)) ||
           Number(reporter.activeDeskId || 0) === Number(deskId) ||
-          Number(target.activeDeskId || 0) !== Number(deskId) ||
-          !hasCurrentOwnerSession(desk, at)
+          Number(target.activeDeskId || 0) !== Number(deskId)
         ) {
           throw new Error(
             'Masa durumu değişti veya bu kullanıcı için ihbar uygun değil.'
@@ -1054,8 +1052,7 @@ export function createCloudActions({
         }
 
         if (mode === 'report_timeout' &&
-            (!hasCurrentOwnerSession(desk, at) ||
-             Number(desk.reportIssuedAt || Number(deadline) - 300000) < lastClosingAt(at))) {
+            Number(desk.reportIssuedAt || Number(deadline) - 300000) < lastClosingAt(at)) {
           // A late cleanup must not convert a report cancelled at closing into a penalty.
           const after = releaseUserFromDesk(desk, userId);
           const current = snapshotExists(u) ? u.data() : null;
