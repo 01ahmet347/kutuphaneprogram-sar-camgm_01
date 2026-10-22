@@ -5,6 +5,7 @@ import { createStudentDeskHandler, getIstanbulDayKey } from '../server/student-d
 import { createCloudActions } from '../src/cloud-transactions.js';
 import { outsideLibraryHours } from '../server/daily-close.js';
 import { violationPolicyPatch } from '../src/restriction-policy.js';
+import { recoverPreviousDayDesks } from '../server/morning-recovery.js';
 
 const handler = createStudentDeskHandler({
   async authenticateStudent(req) {
@@ -62,6 +63,7 @@ const handler = createStudentDeskHandler({
 
     return {
       ...actions,
+      recoverStale: () => recoverPreviousDayDesks(),
       closedNow: () => outsideLibraryHours(Date.now(), settings.openTime || '07:00'),
 
       cancel: ({ userId, deskId }) =>
