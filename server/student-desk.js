@@ -24,8 +24,8 @@ export function createStudentDeskHandler({ authenticateStudent, createActions })
       if (!uid) return res.status(401).json({ ok: false, error: 'unauthenticated' });
 
       const { action, deskId, deviceId, qrCode, type, targetUserId, requestId } = req.body || {};
-      if (!['reserve', 'claim', 'cancel', 'expire', 'break-start', 'break-end', 'break-repair', 'report', 'verify', 'leave'].includes(action) ||
-          !Number.isInteger(Number(deskId)) || Number(deskId) < 1 || Number(deskId) > 35 ||
+      if (!['reserve', 'claim', 'cancel', 'expire', 'break-start', 'break-end', 'break-repair', 'report', 'verify', 'leave', 'recover-stale'].includes(action) ||
+          action !== 'recover-stale' && (!Number.isInteger(Number(deskId)) || Number(deskId) < 1 || Number(deskId) > 35) ||
           ['reserve', 'claim'].includes(action) &&
             (typeof deviceId !== 'string' || deviceId.length < 1 || deviceId.length > 180) ||
           ['claim', 'break-end', 'verify'].includes(action) && (typeof qrCode !== 'string' || qrCode.length < 1 || qrCode.length > 500) ||
@@ -35,6 +35,11 @@ export function createStudentDeskHandler({ authenticateStudent, createActions })
       }
 
       const actions = await createActions();
+      // Masa seçimi gerektirmez; hiçbir öğrenci verisini istemez veya geri döndürmez.
+      if (action === 'recover-stale') {
+        const result = await actions.recoverStale();
+        return res.status(200).json({ ok: true, result });
+      }
       // Kapanıştan sonra istekler ceza üretemez; cron masa oturumlarını cezasız kapatır.
       if (actions.closedNow?.()) {
         if (action === 'expire') return res.status(200).json({ ok: true, result: null });
