@@ -457,6 +457,9 @@ export function createCloudActions({
         }
 
         const at = now();
+        if (Number(desk.breakEndTime || 0) <= at) {
+          throw new Error('Mola süreniz doldu. Masanız otomatik boşaltma işlemine alındı.');
+        }
 
         const nextDesk = {
           ...desk,
@@ -523,8 +526,7 @@ export function createCloudActions({
         if (
           userId === targetUserId ||
           desk.occupant !== targetUserId ||
-          !(desk.status === 'occupied' ||
-            (desk.status === 'on_break' && Number(desk.breakEndTime || 0) <= at)) ||
+          desk.status !== 'occupied' ||
           Number(reporter.activeDeskId || 0) === Number(deskId) ||
           Number(target.activeDeskId || 0) !== Number(deskId)
         ) {

@@ -44,8 +44,8 @@ service cloud.firestore {
       return request.resource.data.diff(resource.data).affectedKeys().hasAny([
         'activeDeskId', 'activeDeskRole', 'pendingDeskId',
         'pendingDeskDeadline', 'adminDeskOverrideDeskId',
-        'adminDeskOverrideSessionStart', 'lastBreakSession',
-        'lastActiveTime', 'gmDeskAccessAt', 'deskReclaimDeskId',
+        'adminDeskOverrideSessionStart', 'lastBreakSession', 'lastAutoBreakRelease',
+        'lastActiveTime', 'gmDeskAccessAt', 'deskReleasedAt', 'deskReclaimDeskId',
         'deskReclaimAllowedAt'
       ]);
     }

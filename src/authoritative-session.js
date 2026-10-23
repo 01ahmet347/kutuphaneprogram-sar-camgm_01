@@ -13,7 +13,8 @@ export const USER_SESSION_FIELDS = Object.freeze([
   'activeDeskId', 'activeDeskRole', 'pendingDeskId', 'pendingDeskDeadline',
   'adminDeskOverrideDeskId', 'adminDeskOverrideSessionStart', 'breaks',
   'breaksResetDate', 'lastBreakSession', 'lastActiveTime', 'gmDeskAccessAt',
-  'deskReclaimDeskId', 'deskReclaimAllowedAt'
+  'deskReclaimDeskId', 'deskReclaimAllowedAt', 'deskReleasedAt',
+  'lastAutoBreakRelease'
 ]);
 export function withoutSessionWrites(patch, bucket) {
   const forbidden = bucket === 'desks' ? DESK_SESSION_FIELDS : bucket === 'users' ? USER_SESSION_FIELDS : [];

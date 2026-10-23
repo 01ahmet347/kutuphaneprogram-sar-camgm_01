@@ -1644,6 +1644,29 @@ function MainApp() {
     }
   }, [desks, users, currentUser, settings.reportWaitTime]);
 
+  // Sunucunun masa boşaltma nedeni kullanıcı belgesinde saklanır.
+  // Telefon/internet kapalıyken gerçekleşen olay, yeniden girişte de görünür.
+  useEffect(() => {
+    if (!currentUser?.id || adminAuthorized || !isDataLoaded) return;
+    const myself = (Array.isArray(users) ? users : []).find(user => user.id === currentUser.id);
+    const release = myself?.lastAutoBreakRelease;
+    if (!release?.eventId || !Number.isFinite(Number(release.releasedAt))) return;
+    const key = `sgm_seen_auto_release_${currentUser.id}_${release.eventId}`;
+    try { if (localStorage.getItem(key) === 'seen') return; } catch (_) {}
+    try { localStorage.setItem(key, 'seen'); } catch (_) {}
+    const label = release.breakType === 'short' ? 'Kısa mola' : release.breakType === 'long' ? 'Uzun mola' : 'Mola';
+    const text = release.reason || `${label} süreniz dolduğu için Masa ${release.deskId} otomatik boşaltıldı.`;
+    const available = Number(release.reclaimAllowedAt) > Date.now()
+      ? `Aynı masayı ${formatDateTime(release.reclaimAllowedAt)} itibarıyla tekrar alabilirsiniz.`
+      : 'Aynı masa için 30 dakikalık bekleme süreniz sona erdi.';
+    showMessage('Masanız Otomatik Boşaltıldı',
+      <div className="space-y-2 text-sm">
+        <p>{text}</p>
+        <p className="font-semibold text-amber-700">{available}</p>
+        <p>Başka uygun masaları alabilirsiniz. Bu işlem ihlal sayılmadı.</p>
+      </div>, 'warning');
+  }, [users, currentUser?.id, adminAuthorized, isDataLoaded]);
+
   useEffect(() => {
     if (!db || !fbUser || !currentUser?.id) { setStudentMessages([]); return; }
     let retryTimer;
@@ -6837,7 +6860,7 @@ function MainApp() {
     : safeBreakCountdown(myDesk, now + serverTimeOffsetMs);
   // Süre 00:00 olduğunda sunucu masanın HALA molada olduğunu yeniden doğrular.
   // Sistem kaydı tekrar girildiğinde çoğalmaz; QR dönüşü/aktif oturum değişmez.
-  // Öğrenci uygulaması tamamen kapalıysa istemci kontrol yapamaz.
+  // Uygulama kapalıyken zamanlayıcı aynı kontrolü sunucuda yürütür.
   const expiredBreak = expiredBreakDetails({
     desk: myDesk, userId: currentUser?.id, activeDeskId: myUserObj?.activeDeskId,
     isGuest: myIsGuest, at: now + serverTimeOffsetMs, clockVerified: serverClockVerified

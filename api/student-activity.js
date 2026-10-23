@@ -1,6 +1,7 @@
 import { getAuth } from 'firebase-admin/auth';
 import { adminApp, dataCollection } from '../server/firebase-admin.js';
 import { createStudentActivityHandler, createStudentProfileWriters } from '../server/student-activity.js';
+import { releaseExpiredBreaksForDesk } from '../server/break-auto-release.js';
 
 const writers = createStudentProfileWriters({ dataCollection });
 const handler = createStudentActivityHandler({
@@ -10,7 +11,8 @@ const handler = createStudentActivityHandler({
     const decoded = await getAuth(adminApp()).verifyIdToken(token);
     return decoded.role === 'student' ? decoded.uid : null;
   },
-  ...writers
+  ...writers,
+  autoReleaseBreak: deskId => releaseExpiredBreaksForDesk({ deskId, collection: dataCollection })
 });
 
 export default handler;

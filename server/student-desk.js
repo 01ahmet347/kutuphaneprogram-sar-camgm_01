@@ -11,7 +11,7 @@ const getIstanbulDayKey = (date = new Date()) => {
   return `${values.year}-${values.month}-${values.day}`;
 };
 
-export function createStudentDeskHandler({ authenticateStudent, createActions }) {
+export function createStudentDeskHandler({ authenticateStudent, createActions, autoReleaseBreak }) {
   return async function studentDeskHandler(req, res) {
     res.setHeader('Cache-Control', 'no-store');
     if (req.method !== 'POST') {
@@ -34,6 +34,11 @@ export function createStudentDeskHandler({ authenticateStudent, createActions })
         return res.status(400).json({ ok: false, error: 'invalid_request' });
       }
 
+      // Sunucuya ulaşan bir istekte zamanlayıcı gecikmişse önce süresi dolan molayı temizle.
+      // Telefon kapalı olduğunda ayrı zamanlayıcı aynı işlemi yapar.
+      if (autoReleaseBreak && action !== 'expire' && action !== 'break-repair') {
+        await autoReleaseBreak(Number(deskId));
+      }
       const actions = await createActions();
       // Kapanıştan sonra istekler ceza üretemez; cron masa oturumlarını cezasız kapatır.
       if (actions.closedNow?.()) {

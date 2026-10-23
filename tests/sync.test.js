@@ -114,14 +114,14 @@ test('daily student limits reset on the server before a new break is started',as
   assert.equal(db.data.get('sgmUsers/a').breaksResetDate,'2026-10-07');
   assert.equal(db.data.get('sgmUsers/a').violationsResetDate,'2026-10-07');
 });
-test('late QR return ends an expired break without a penalty when no report exists',async()=>{
+test('late QR return cannot bypass automatic expiry or create a penalty',async()=>{
   const db=memoryDatabase({
     'sgmUsers/a':{...user('a'),activeDeskId:1},
     'sgmDesks/1':{...desk(1),status:'on_break',occupant:'a',breakEndTime:900}
   });
-  await actions(db).endBreak({userId:'a',deskId:1,qrCode:'QR-1-test'});
+  await assert.rejects(actions(db).endBreak({userId:'a',deskId:1,qrCode:'QR-1-test'}),/Mola süreniz doldu/);
   assert.equal(db.data.get('sgmUsers/a').strikes,0);
-  assert.equal(db.data.get('sgmDesks/1').status,'occupied');
+  assert.equal(db.data.get('sgmDesks/1').status,'on_break');
 });
 test('student report and presence verification are transactional and scoped to authenticated students',async()=>{
   const db=memoryDatabase({
@@ -280,7 +280,7 @@ test('an admin assignment does not erase restriction and is not reversed by a no
   assert.equal(db.data.get('sgmUsers/a').restrictedUntil, 5000000);
 });
 
-test('an expired break can be reported and has precisely five minutes to verify', async () => {
+test('expired break cannot be converted into a report to bypass automatic release', async () => {
   const db = memoryDatabase({
     'sgmUsers/reporter': { ...user('reporter'), activeDeskId: 2, canReport: true },
     'sgmUsers/target': { ...user('target'), activeDeskId: 1 },
@@ -288,10 +288,8 @@ test('an expired break can be reported and has precisely five minutes to verify'
     'sgmDesks/2': { ...desk(2), status: 'occupied', occupant: 'reporter' }
   });
   const api = actions(db);
-  const report = await api.reportDesk({ userId: 'reporter', deskId: 1, targetUserId: 'target' });
-  assert.equal(report.desk.reportEndTime, 301000);
-  assert.equal(report.desk.status, 'reported');
-  await api.verifyPresence({ userId: 'target', deskId: 1, qrCode: 'QR-1-test' });
+  await assert.rejects(api.reportDesk({ userId: 'reporter', deskId: 1, targetUserId: 'target' }),/uygun değil/);
+  assert.equal(db.data.get('sgmDesks/1').status, 'on_break');
   assert.equal(db.data.get('sgmUsers/target').strikes, 0);
 });
 

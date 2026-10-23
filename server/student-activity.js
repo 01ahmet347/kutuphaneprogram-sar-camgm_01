@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { expiredBreakDetails } from '../src/break-expiry-audit.js';
+import { releaseExpiredBreaksForDesk } from './break-auto-release.js';
 
 const STUDENT_EVENT_PREFIXES = [
   'SISTEM_GIRIS',
@@ -19,7 +20,7 @@ const STUDENT_EVENT_PREFIXES = [
   'UYGULAMA_'
 ];
 
-export function createStudentActivityHandler({ authenticateStudent, saveFeedback, savePushToken, saveAuditEvent, saveBreakExpiryEvent }) {
+export function createStudentActivityHandler({ authenticateStudent, saveFeedback, savePushToken, saveAuditEvent, saveBreakExpiryEvent, autoReleaseBreak }) {
   return async function studentActivityHandler(req, res) {
     res.setHeader('Cache-Control', 'no-store');
     if (req.method !== 'POST') {
@@ -54,6 +55,11 @@ export function createStudentActivityHandler({ authenticateStudent, saveFeedback
           return res.status(400).json({ ok: false, error: 'invalid_desk' });
         }
         result = await saveBreakExpiryEvent(uid, body.deskId);
+        // Eski 00:00 logunu koru; masa boşaltma sunucu tarafından ayrıca doğrulanır.
+        if (autoReleaseBreak && (result?.saved || result?.reason === 'deleted')) {
+          const release = await autoReleaseBreak(body.deskId);
+          result = { ...result, autoRelease: release };
+        }
       } else if (body.action === 'audit-event') {
         const record = body.record;
         if (!record || typeof record !== 'object' || Array.isArray(record) ||

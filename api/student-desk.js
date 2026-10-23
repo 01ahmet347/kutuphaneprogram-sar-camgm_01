@@ -5,8 +5,10 @@ import { createStudentDeskHandler, getIstanbulDayKey } from '../server/student-d
 import { createCloudActions } from '../src/cloud-transactions.js';
 import { outsideLibraryHours } from '../server/daily-close.js';
 import { violationPolicyPatch } from '../src/restriction-policy.js';
+import { releaseExpiredBreaksForDesk } from '../server/break-auto-release.js';
 
 const handler = createStudentDeskHandler({
+  autoReleaseBreak: deskId => releaseExpiredBreaksForDesk({ deskId, collection: dataCollection }),
   async authenticateStudent(req) {
     const token = /^Bearer\s+(.+)$/i.exec(
       req.headers?.authorization || ''
