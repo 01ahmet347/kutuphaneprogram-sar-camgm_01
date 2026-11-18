@@ -14,7 +14,7 @@ export default async function handler(req, res) {
   if (!['delete_user', 'expire', 'approve_user', 'approve_users', 'update_user', 'restore_report_permission','update_settings','close_history'].includes(action) ||
       action === 'approve_user' && !validApprovalIds([userId]) ||
       action === 'approve_users' && !validApprovalIds(userIds) ||
-      ['update_user','restore_report_permission','update_settings','close_history'].includes(action) && !validApprovalIds([userId]) ||
+      ['update_user','restore_report_permission'].includes(action) && !validApprovalIds([userId]) ||
       action === 'delete_user' && (typeof userId !== 'string' || !userId || userId.includes('/') || userId.length > 180) ||
       action === 'expire' && (!Number.isInteger(deskId) || deskId < 1 || deskId > 35)) {
     return res.status(400).json({ ok: false, message: 'Geçersiz işlem.' });
