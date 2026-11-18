@@ -957,6 +957,8 @@ function MainApp() {
   
   const [loginIdentity, setLoginIdentity] = useState('');
   const [loginPin, setLoginPin] = useState('');
+  const [rememberLoginPrompt, setRememberLoginPrompt] = useState(null);
+  const [rememberedLoginCode, setRememberedLoginCode] = useState(() => { try { return localStorage.getItem('sgm_remembered_login_code_v1') || ''; } catch { return ''; } });
   
   const [settings, setSettings] = useState(() => {
     const saved = localStorage.getItem('sgm_settings');
@@ -966,6 +968,8 @@ function MainApp() {
   const settingsRef = useRef(settings);
   const [registrationLinkSaving, setRegistrationLinkSaving] = useState(false);
   const [systemSettingsSaving, setSystemSettingsSaving] = useState(false);
+  const [closureHistory, setClosureHistory] = useState([]);
+  const [closureHistoryStatus, setClosureHistoryStatus] = useState('');
   const systemSettingsSavingRef = useRef(false);
   const [registrationRedirectBusy, setRegistrationRedirectBusy] = useState(false);
   const registrationRedirectInFlightRef = useRef(false);
@@ -1239,6 +1243,7 @@ function MainApp() {
   const qrBackupOperationRef = useRef(false);
   const qrBackupInputRef = useRef(null);
   const [userSearch, setUserSearch] = useState('');
+  const [manualAssignSearch, setManualAssignSearch] = useState('');
   const [archiveLoading, setArchiveLoading] = useState(false);
   const [archivedLogs, setArchivedLogs] = useState([]);
   const archiveCursorRef = useRef({ sgmAudit: null, sgmLogs: null });
@@ -1994,9 +1999,10 @@ function MainApp() {
     if (!adminAuthorized || !auth?.currentUser) throw new Error('Yönetici yetkisi gerekli.');
     // Onay işleminde ikinci bir zorunlu token yenileme turunu bekleme;
     // gerçek yetki ve aktif yönetici oturumu yine API'de kontrol edilir.
-    if (action !== 'approve_users' && action !== 'approve_user') await requireAdminForUserWrite();
+    if (!['approve_users', 'approve_user', 'update_user', 'update_settings', 'close_history'].includes(action)) await requireAdminForUserWrite();
     const token = await auth.currentUser.getIdToken();
     const response = await fetch('/api/admin-maintenance', {
+      signal: typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(30000) : undefined,
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify({ action, ...input })
@@ -2005,6 +2011,15 @@ function MainApp() {
     if (!response.ok || payload?.ok !== true) throw new Error(payload?.message || 'Yönetici işlemi sunucuda tamamlanamadı.');
     return payload.result;
   };
+  useEffect(() => {
+    if (adminTab !== 'settings' || !adminAuthorized || !fbUser) return;
+    let cancelled = false;
+    setClosureHistoryStatus('Yükleniyor...');
+    runAdminMaintenance('close_history').then(result => {
+      if (!cancelled) { setClosureHistory(result.history || []); setClosureHistoryStatus(''); }
+    }).catch(() => { if (!cancelled) setClosureHistoryStatus('Kapanış geçmişi şu an getirilemedi.'); });
+    return () => { cancelled = true; };
+  }, [adminTab, adminAuthorized, fbUser?.uid]);
   const runStudentActivity = async (action, input = {}) => {
     if (!fbUser) throw new Error('Öğrenci oturumu bulunamadı.');
     const idToken = await fbUser.getIdToken();
@@ -2279,7 +2294,7 @@ function MainApp() {
         const remote = baselineKey === 'users' ? normalizeRemoteUsers([snap.data()])[0] : normalizeRemoteDesks([snap.data()])[0] || snap.data();
         const fields = baselineKey === 'desks' ? ['status','occupant','ownerDeviceId','pendingOccupant','pendingDeskDeadline','pendingDeskRole','breakEndTime','reportEndTime','reportIssuedAt','reportVerifiedAt','sessionStartTime'] : ['activeDeskId','activeDeskRole','pendingDeskId','pendingDeskDeadline'];
         const patch = withoutSessionWrites(withoutAccountApprovalWrites(preventClosedHoursSessionWrites(
-          atomicFieldPatch(remote, previous, row, fields), baselineKey, Date.now(), settingsRef.current.openTime
+          atomicFieldPatch(remote, previous, row, fields), baselineKey, Date.now(), settingsRef.current.openTime, settingsRef.current.closeTime
         )), baselineKey);
         if (Object.keys(patch).length) tx.set(target, patch, { merge: true });
         return { ...remote, ...patch };
@@ -2448,23 +2463,12 @@ function MainApp() {
     try {
       if (db) {
         if (!auth) throw new Error('Firebase oturumu bulunamadı. Yönetici paneline yeniden giriş yapın.');
-        await ensureTabAuthPersistence(); await auth.authStateReady();
+        await ensureTabAuthPersistence();
         const liveUser = auth.currentUser;
         if (!liveUser) throw new Error('Yönetici oturumu sona ermiş. Yönetici paneline yeniden giriş yapın.');
-        let tokenResult;
-        try { tokenResult = await liveUser.getIdTokenResult(true); }
-        catch (error) { throw new Error('Yönetici oturumu sunucudan doğrulanamadı. Bağlantınızı kontrol edip tekrar deneyin.'); }
-        if (auth.currentUser?.uid !== liveUser.uid) throw new Error('Oturum değişti. Yönetici paneline yeniden giriş yapın.');
-        if (tokenResult.claims.admin !== true) {
-          setAdminAuthorized(false);
-          throw new Error('Mevcut Firebase oturumunda yönetici yetkisi yok. Yönetici kullanıcı adı ve şifresiyle yeniden giriş yapın.');
-        }
-        // React state'i geride kalsa bile gerçek ve doğrulanmış oturum kullanılır.
-        verifiedAdminUidRef.current = liveUser.uid;
-        setFbUser(liveUser); setAdminAuthorized(true);
+        // Sunucu requireActiveAdmin ile yetkiyi doğrular. İkinci zorunlu token yenileme
+        // ve ilgisiz senkronizasyon kuyruğu kısıt kaydını bloke etmez.
       }
-      // Önceden sıraya alınmış yazmalar bu açık yönetici işlemini geri alamaz.
-      await granularWriteChainRef.current.catch(() => {});
       const patch = Object.fromEntries(Object.entries(desired).filter(([key, value]) => key !== 'id' && stableJson(value) !== stableJson(original[key])));
       // Yalnızca yönetici tarafından gerçekten değiştirilen alanları gönder.
       // Ad/şifre düzenlemesi eski kısıt bilgisini istemeden geri yazamaz.
@@ -2555,7 +2559,7 @@ function MainApp() {
   useEffect(() => {
     if (!db || !fbUser || !currentUser?.id || fbUser.uid !== currentUser.id ||
         !serverClockVerified || !navigator.onLine ||
-        !isIstanbulAfterClose(now + serverTimeOffsetMs)) return;
+        !isIstanbulAfterClose(now + serverTimeOffsetMs, settings.closeTime)) return;
     const deskId = Number(currentUser.activeDeskId || currentUser.pendingDeskId);
     if (!Number.isInteger(deskId) || deskId < 1 || deskId > 35) return;
     const action = currentUser.activeDeskId ? 'leave' : 'cancel';
@@ -3972,7 +3976,7 @@ function MainApp() {
       const usersForDailyBreakCheck = Array.isArray(usersRef.current) ? usersRef.current : [];
       const hasUserWithOldBreakDay = usersForDailyBreakCheck.some(u => u.breaksResetDate !== todayKey);
       const hasUserWithOldViolationDay = usersForDailyBreakCheck.some(u => u.violationsResetDate !== todayKey);
-      if (hasUserWithOldBreakDay || hasUserWithOldViolationDay) {
+      if (!db && (hasUserWithOldBreakDay || hasUserWithOldViolationDay)) {
          needUserReset = true;
          if (hasUserWithOldBreakDay) {
            addLog('GUNLUK_MOLA_HAKLARI_YENILENDI', `Yeni gün (${todayKey}) başladı. Tüm öğrencilerin kısa ve uzun mola hakları yeniden tanımlandı.`);
@@ -3982,13 +3986,13 @@ function MainApp() {
          }
       }
 
-      if (settings.openTime && currentHourMin === settings.openTime && localStorage.getItem('sgm_last_reset') !== todayStr) {
+      if (!db && settings.openTime && currentHourMin === settings.openTime && localStorage.getItem('sgm_last_reset') !== todayStr) {
          needUserReset = true;
          try { localStorage.setItem('sgm_last_reset', todayStr); } catch(e){}
          addLog('SİSTEM_OTOMATİK', 'Yeni gün başlangıcı: Tüm mola ve ihlal hakları sıfırlandı.');
       }
 
-      if ((!db || adminAuthorized) && settings.closeTime && !checkLibraryOpen() && currentTimeMin >= closeTimeMin && localStorage.getItem('sgm_last_close') !== todayStr) {
+      if (!db && settings.closeTime && !checkLibraryOpen() && currentTimeMin >= closeTimeMin && localStorage.getItem('sgm_last_close') !== todayStr) {
          // 22:00 kapanışında sadece bildirim/log değil, masa + kullanıcı + localStorage + Firestore
          // aynı işlem içinde temizlenir. İşaret, temizlik başlatıldıktan sonra yazılır.
          runFullDayCleanup({
@@ -4033,7 +4037,7 @@ function MainApp() {
       const safetyMarkerKey = `sgm_last_dynamic_safety_check_v3_${safetyTimeKey}`;
 
       if (
-        (!db || adminAuthorized) && safetyWindowReached &&
+        !db && safetyWindowReached &&
         localStorage.getItem(safetyMarkerKey) !== todayStr
       ) {
          const desksAtSafety = Array.isArray(desksRef.current) ? desksRef.current : [];
@@ -4889,13 +4893,16 @@ function MainApp() {
     setDeskSelectionDeadline(pendingIsValid ? Number(user.pendingDeskDeadline) : null);
 
     setView('student_dash');
+    if (!credentials && localStorage.getItem('sgm_login_remember_choice_v1') == null) {
+      setRememberLoginPrompt({ specialCode: updatedUser.specialCode });
+    }
     addLog('ÖĞRENCİ_GİRİŞİ', `${updatedUser.name} sisteme giriş yaptı.`, updatedUser.activeDeskId || null, updatedUser.id);
 
     if (updatedUser.blocked || isRestricted(updatedUser)) {
       setTimeout(() => {
         showMessage(
           'Hesabınız Şu An Kısıtlı',
-          'Kısıtınızı kaldırabilmeniz için kütüphane sorumlumuz ile iletişime geçebilirsiniz. Gerekli kontroller yapıldıktan sonra sorumlu tarafından hesabınız aktif edilecektir.',
+          `${updatedUser.restrictionReason ? `Neden: ${updatedUser.restrictionReason}\n` : ''}Kısıtınızı kaldırabilmeniz için kütüphane sorumlumuz ile iletişime geçebilirsiniz. Gerekli kontroller yapıldıktan sonra sorumlu tarafından hesabınız aktif edilecektir.`,
           'warning'
         );
       }, 150);
@@ -6562,6 +6569,7 @@ function MainApp() {
             const parsedStrikes = parseInt(formData.get('editStrikes'), 10);
             const newStrikes = Number.isFinite(parsedStrikes) ? Math.max(0, parsedStrikes) : 0;
             const restrictionDays = Math.max(0, Number(formData.get('restrictionDays') || 0));
+            const restrictionText = String(formData.get('restrictionReason') || '').trim().slice(0, 300);
             const newBlocked = false;
             const newCanReport = formData.get('editCanReport') === 'on';
 
@@ -6585,7 +6593,7 @@ function MainApp() {
               blocked: newBlocked,
               pendingApproval: formData.get("approveAccount") === "on" ? false : user.pendingApproval === true,
               restrictedUntil: restrictionDays > 0 ? Date.now() + restrictionDays * 86400000 : 0,
-              restrictionReason: restrictionDays > 0 ? 'Yönetici tarafından süreli kısıtlama' : '',
+              restrictionReason: restrictionDays > 0 ? (restrictionText || 'Yönetici tarafından süreli kısıtlama') : '',
               canReport: newCanReport
             };
             // Onay/engel/süreli kısıt kalktığı anda ihbar yetkisini de aç.
@@ -6690,6 +6698,12 @@ function MainApp() {
               <span className="font-bold">Süreli kısıtlama (gün)</span>
               <input name="restrictionDays" type="number" min="0" step="1" defaultValue={Number(user.restrictedUntil || 0) > Date.now() ? Math.ceil((user.restrictedUntil-Date.now())/86400000) : 0} className="w-full p-2 border rounded-lg mt-2" />
               <span className="text-xs">0: Kısıtlamayı kaldır. Bitiş: {user.pendingApproval ? 'Sorumlu onayı bekleniyor' : Number(user.restrictedUntil || 0) > Date.now() ? new Date(user.restrictedUntil).toLocaleString('tr-TR') : 'Aktif'}</span>
+              <label className="block text-xs font-bold mt-3">Kısıtlama nedeni / öğrenciye mesaj
+                <textarea name="restrictionReason" maxLength={300} rows={3} defaultValue={user.restrictionReason || ''}
+                  placeholder="Örn. Kütüphane kurallarına aykırı davranış nedeniyle..."
+                  className="w-full mt-1 p-2 border border-red-200 rounded-lg bg-white font-normal" />
+              </label>
+              <p className="text-xs text-red-700">Kısıt uygulandığında öğrenci bu mesajı hesabında görür. Eski kısıt geçmişi silinmez.</p>
             </label>
 
             <label className="flex items-center justify-between gap-3 p-3 bg-slate-50 border border-slate-200 rounded-xl cursor-pointer">
@@ -6791,16 +6805,19 @@ function MainApp() {
             {liveDesk.status === 'available' && (
                <div className="col-span-2 p-3 bg-blue-50 border border-blue-200 rounded-lg mb-2">
                  <p className="text-xs font-bold text-blue-800 mb-2">Öğrenci Ata (Manuel Düzenleme)</p>
+                 <input type="search" value={manualAssignSearch} onChange={e => setManualAssignSearch(e.target.value)}
+                   placeholder="Ad, soyad veya GM özel koduyla ara" aria-label="Manuel masa atamada öğrenci ara"
+                   className="w-full p-2 rounded-lg border border-blue-300 bg-white text-sm mb-2" />
                  <div className="flex gap-2">
                    <select id={`assign_user_${liveDesk.id}`} className="flex-1 p-2 rounded border border-blue-300 text-sm bg-white">
                       <option value="">Öğrenci Seçin...</option>
-                      {safeUsers.filter(u => !u.activeDeskId && !u.pendingApproval).map(u => (
+                      {safeUsers.filter(u => !u.activeDeskId && !u.pendingApproval && [u.name, u.specialCode].some(value => String(value || '').toLocaleLowerCase('tr-TR').includes(manualAssignSearch.trim().toLocaleLowerCase('tr-TR')))).map(u => (
                          <option key={u.id} value={u.id}>{u.name} • GM Özel Kod: {u.specialCode}{deskWaitRemaining(u) > 0 ? " • 30 dk bekleme: yönetici atayabilir" : ""}</option>
                       ))}
                    </select>
                    <button onClick={() => {
                       const uid = document.getElementById(`assign_user_${liveDesk.id}`).value;
-                      if(uid) { handleAdminAction('assign_user', liveDesk.id, uid); closeMessage(); setLiveDeskId(null); }
+                      if(uid) { handleAdminAction('assign_user', liveDesk.id, uid); closeMessage(); setLiveDeskId(null); setManualAssignSearch(''); }
                    }} className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded font-bold text-sm shadow">Ata</button>
                  </div>
                </div>
@@ -8070,6 +8087,7 @@ function MainApp() {
                       name="identityNo"
                       value={loginIdentity}
                       onChange={e => setLoginIdentity(e.target.value.replace(/\D/g,'').slice(0,8))}
+                      onFocus={() => { if (!loginIdentity && rememberedLoginCode) setLoginIdentity(rememberedLoginCode); }}
                       required 
                       placeholder="12345678"
                       autoComplete="username"
@@ -8079,7 +8097,7 @@ function MainApp() {
                 <div>
                   <label className="block text-sm font-semibold text-slate-700 mb-2">Şifreniz</label>
                   <input 
-                      type="text"
+                      type="password"
                       name="pin"
                       value={loginPin}
                       onChange={e => setLoginPin(e.target.value.replace(/\D/g,'').slice(0,8))}
@@ -8091,12 +8109,16 @@ function MainApp() {
                       placeholder="********"
                       autoCapitalize="none"
                       autoCorrect="off"
-                      autoComplete="off"
+                      autoComplete="current-password"
                       spellCheck={false}
                       style={{ WebkitTextSecurity: 'disc' }}
                       className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all font-medium tracking-widest"
                   />
                 </div>
+                {rememberedLoginCode && <button type="button" onClick={() => {
+                  try { localStorage.removeItem('sgm_remembered_login_code_v1'); localStorage.removeItem('sgm_login_remember_choice_v1'); } catch {}
+                  setRememberedLoginCode(''); setLoginIdentity('');
+                }} className="text-xs text-slate-500 underline">Bu cihazda hatırlanan GM kodunu kaldır</button>}
                 <button type="submit" className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-4 rounded-xl flex items-center justify-center gap-2 shadow-lg shadow-blue-200">Giriş Yap <LogIn className="w-5 h-5" /></button>
                 <button type="button" onClick={()=>{setRegistrationAccepted(false);setRegistrationRulesOpen(true);setShowRules(true);}} className="w-full py-3 border border-blue-300 text-blue-700 rounded-xl font-bold">Kayıt Ol</button>
                 {registrationPending && registrationFormOpened && <p className="text-sm text-blue-700">Kayıt formuna <b>GM özel kodunu yazmayı unutmayın.</b> Formu gönderin; yönetici kontrol ettikten sonra kısıtı kaldıracaktır.</p>}
@@ -8518,7 +8540,7 @@ function MainApp() {
                       <button
                         key={tab.id}
                         type="button"
-                        onClick={() => { setAdminTab(tab.id); addLog('ADMIN_SEKME', `${tab.label} sekmesi açıldı.`); }}
+                        onClick={() => setAdminTab(tab.id)}
                         className={`w-full min-h-12 px-3 sm:px-4 py-3 rounded-xl text-xs sm:text-sm font-bold flex items-center gap-2 sm:gap-3 transition-colors ${adminTab === tab.id ? 'bg-blue-600 text-white shadow-md' : 'text-slate-300 hover:bg-slate-800 hover:text-white'}`}
                       >
                         <span className="shrink-0">{tab.icon}</span>
@@ -8843,42 +8865,24 @@ function MainApp() {
                      systemSettingsSavingRef.current = true;
                      setSystemSettingsSaving(true);
                      try {
-                       // Bekleyen eski yazıları tamamla; yeni ayarları gecikmeden sunucuya yaz.
-                       if (granularWriteTimerRef.current) {
-                         clearTimeout(granularWriteTimerRef.current);
-                         granularWriteTimerRef.current = null;
+                       // Ayarlar sunucuda atomik kaydedilir; masalara, QR'lara ve push verilerine dokunulmaz.
+                       const previous = settingsRef.current;
+                       const result = db
+                         ? await runAdminMaintenance('update_settings', { patch: settingsPatch })
+                         : { settings: { ...previous, ...settingsPatch }, updatedBalances: [] };
+                       const next = result.settings;
+                       settingsRef.current = next;
+                       granularBaselineRef.current.settings = stableJson(next);
+                       setSettings(next);
+                       if (Array.isArray(result.updatedBalances) && result.updatedBalances.length) {
+                         const balances = new Map(result.updatedBalances.map(item => [String(item.id), item.breaks]));
+                         usersRef.current = usersRef.current.map(u => balances.has(String(u.id)) ? { ...u, breaks: balances.get(String(u.id)) } : u);
+                         setUsers(usersRef.current);
                        }
-                       const save = granularWriteChainRef.current.catch(() => {}).then(async () => {
-                         let previousSettings = settingsRef.current;
-                         const ref = db ? getLiveSettingsDoc() : null;
-                         const next = db ? await runTransaction(db, async tx => {
-                           const snap = await tx.get(ref);
-                           const base = snap.exists() ? { ...DEFAULT_SETTINGS, ...snap.data() } : settingsRef.current;
-                           previousSettings = base;
-                           tx.set(ref, settingsPatch, { merge: true });
-                           return { ...base, ...settingsPatch };
-                         }) : {...settingsRef.current, ...settingsPatch};
-                         granularBaselineRef.current.settings = stableJson(next);
-                         settingsRef.current = next;
-                         setSettings(next);
-                         if (previousSettings.shortBreakCount !== next.shortBreakCount || previousSettings.longBreakCount !== next.longBreakCount || previousSettings.hourlyBreakCount !== next.hourlyBreakCount || previousSettings.hourlyBreakEnabled !== next.hourlyBreakEnabled) {
-                           for (const localUser of [...usersRef.current]) {
-                             const user = db ? await runTransaction(db, async tx => {
-                               const userRef = getLiveDoc('sgmUsers', localUser.id);
-                               const snapshot = await tx.get(userRef);
-                               if (!snapshot.exists()) return null;
-                               const remote = {...snapshot.data(), id: localUser.id};
-                               const breaks = updatedBreakAllowance(remote, previousSettings, next);
-                               tx.set(userRef, {breaks}, {merge: true});
-                               return {...remote, breaks};
-                             }) : {...localUser, breaks: updatedBreakAllowance(localUser, previousSettings, next)};
-                             if (user) applyCloudRows({user});
-                           }
-                         }
-                         return next;
-                       });
-                       granularWriteChainRef.current = save.catch(() => {});
-                       await save;
+                       if (!db && ['shortBreakCount','longBreakCount','hourlyBreakCount','hourlyBreakEnabled'].some(k => previous[k] !== next[k])) {
+                         usersRef.current = usersRef.current.map(u => ({ ...u, breaks: updatedBreakAllowance(u, previous, next) }));
+                         setUsers(usersRef.current);
+                       }
 
                      // Çalışma saatlerindeki değişiklikleri sistem kayıtlarına ayrıca yaz.
                      if (previousCloseTime !== nextCloseTime) {
@@ -8984,6 +8988,19 @@ function MainApp() {
                     </div>
                     <button type="submit" disabled={systemSettingsSaving} className="w-full bg-slate-800 text-white font-bold py-4 rounded-xl shadow-md hover:bg-slate-900 transition-colors disabled:opacity-50">{systemSettingsSaving ? 'Kaydediliyor…' : 'Ayarları Kaydet'}</button>
                   </form>
+                  <div className="mt-6 p-4 rounded-xl border border-slate-200 bg-slate-50">
+                    <h3 className="font-black text-slate-800">Otomatik Kapanış Geçmişi</h3>
+                    <p className="text-xs text-slate-600 mt-1">Yalnızca sunucu tarafından tamamlanan kapanışlar listelenir. Geçmiş kayıtlar silinmez.</p>
+                    {closureHistoryStatus && <p className="text-sm text-amber-700 mt-2">{closureHistoryStatus}</p>}
+                    {closureHistory.length === 0 && !closureHistoryStatus && <p className="text-sm text-slate-600 mt-2">Henüz sunucu kapanış kaydı yok.</p>}
+                    <div className="space-y-2 mt-3">
+                      {closureHistory.map(item => <div key={item.day} className="bg-white border rounded-lg p-3 text-sm flex flex-wrap justify-between gap-2">
+                        <span className="font-semibold">{item.day} · {Number(item.closedAt) ? new Date(item.closedAt).toLocaleTimeString('tr-TR',{hour:'2-digit',minute:'2-digit'}) : '-'} </span>
+                        <span>{item.deskCount || 0} masa · {item.breakUsersCount || 0} mola hakkı yenilendi</span>
+                        <span className="text-emerald-700">{item.status === 'completed' ? 'Tamamlandı' : 'Kaydedildi'}</span>
+                      </div>)}
+                    </div>
+                  </div>
                 </div>
               )}
 
@@ -9545,7 +9562,22 @@ function MainApp() {
       `}</style>
       
       {renderView()}
-      <div title={`Derleme: ${BUILD_COMMIT}`} className="fixed bottom-1 right-2 z-10 text-[10px] text-slate-400 pointer-events-none">Sürüm {APP_VERSION}</div>
+      {rememberLoginPrompt && (
+        <div className="fixed inset-0 z-[100] bg-slate-950/60 flex items-center justify-center p-4">
+          <div role="dialog" aria-modal="true" aria-label="Giriş bilgilerimi hatırla" className="max-w-md w-full bg-white rounded-2xl p-6 shadow-xl space-y-4">
+            <h2 className="text-xl font-black text-slate-900">Bu cihazda GM özel kodunuzu hatırlayalım mı?</h2>
+            <p className="text-sm text-slate-600">Yalnızca GM özel kodunuz bu tarayıcıda kaydedilir. 8 haneli şifreniz uygulamaya kaydedilmez; şifrenizi hatırlamak isterseniz tarayıcınızın güvenli şifre yöneticisini kullanın. Ortak cihazlarda kaydetmeyin.</p>
+            <div className="flex flex-wrap gap-2">
+              <button type="button" onClick={() => {
+                try { localStorage.setItem('sgm_login_remember_choice_v1', 'yes'); localStorage.setItem('sgm_remembered_login_code_v1', rememberLoginPrompt.specialCode); } catch {}
+                setRememberedLoginCode(rememberLoginPrompt.specialCode); setRememberLoginPrompt(null);
+              }} className="flex-1 rounded-xl bg-blue-600 text-white font-bold px-4 py-3">GM Kodumu Hatırla</button>
+              <button type="button" onClick={() => { try { localStorage.setItem('sgm_login_remember_choice_v1', 'no'); } catch {} setRememberLoginPrompt(null); }} className="flex-1 rounded-xl bg-slate-100 text-slate-700 font-bold px-4 py-3">Şimdi Değil</button>
+            </div>
+          </div>
+        </div>
+      )}
+      <div title={`Derleme: ${BUILD_COMMIT}`} className="fixed bottom-1 right-2 z-10 text-[10px] text-slate-400 pointer-events-none">Son Güncelleme: 18.11.2026 · Sürüm {APP_VERSION}</div>
       
       <ScannerModal 
         isOpen={scannerConfig.isOpen} 

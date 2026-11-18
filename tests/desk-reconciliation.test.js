@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { userLinkPatch, releasedDeskUserPatch, deskNeedsClosing } from '../server/desk-integrity.js';
 import { preventClosedHoursSessionWrites } from '../src/session-write-guard.js';
+import { closingDay, istanbulClock, nextDay, previousDay, parseMinutes } from '../src/closing-schedule.js';
+import { istanbulDayKey, allowedBreakCount, isHourlyBreakAvailable } from '../src/break-policy.js';
 
 const now = Date.parse('2026-10-15T16:00:00.000Z');
 const baseUser = { id: 'u1', pin: '12345678', specialCode: '87654321', strikes: 2, violationHistory: [111], activeDeskId: 9 };
@@ -58,11 +60,19 @@ test('a stale client cannot write active desks or reservations after closing or 
 // Load production closing logic with only the Firebase import replaced. No
 // package installation or live Firebase connection is needed for this test.
 const source = await readFile(new URL('../server/daily-close.js', import.meta.url), 'utf8');
-const stripped = source.replace(/^import [^\n]+;\n/gm, '');
+const stripped = source.replace(/^import [^\n]+;\n/gm, '').replace(/^export \{[^\n]+\} from [^\n]+;\n/gm, '');
 const prelude = `
 const dataCollection = () => { throw new Error('Pass mock collection'); };
 const getIstanbulDayKey = date => new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Istanbul', year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
 const deskNeedsClosing = ${deskNeedsClosing.toString()};
+const istanbulDayKey = ${istanbulDayKey.toString()};
+const istanbulClock = ${istanbulClock.toString()};
+const parseMinutes = ${parseMinutes.toString()};
+const nextDay = ${nextDay.toString()};
+const previousDay = ${previousDay.toString()};
+const closingDay = ${closingDay.toString()};
+const isHourlyBreakAvailable = ${isHourlyBreakAvailable.toString()};
+const allowedBreakCount = ${allowedBreakCount.toString()};
 `;
 const { closeLibraryDay } = await import('data:text/javascript;base64,' + Buffer.from(prelude + stripped).toString('base64'));
 
@@ -107,18 +117,19 @@ test('22:00 server closing clears orphaned users, preserves credentials/QR; rech
   items.set('sgmUsers/u1', { ...baseUser });
   items.set('sgmUsers/u2', { id: 'u2', activeDeskId: 14, pin: '09876543' });
   const at = Date.parse('2026-10-15T19:01:00Z');
-  const before = await closeLibraryDay({ collection, at: at - 61000 });
+  const before = await closeLibraryDay({ collection, at: at - 61000, settings: {openTime:'07:00',closeTime:'22:00'} });
   assert.equal(before.reason, 'before_close');
-  const first = await closeLibraryDay({ collection, at });
+  const first = await closeLibraryDay({ collection, at, settings: {openTime:'07:00',closeTime:'22:00'} });
   assert.equal(first.deskCount, 1);
   assert.equal(first.userCount, 2);
   assert.equal(items.get('sgmUsers/u1').activeDeskId, null);
   assert.equal(items.get('sgmUsers/u1').pin, '12345678');
-  assert.equal(items.get('sgmUsers/u1').strikes, 2);
+  assert.equal(items.get('sgmUsers/u1').strikes, 0);
+  assert.deepEqual(items.get('sgmUsers/u1').violationHistory, [111]);
   assert.equal(items.get('sgmDesks/14').qrCode, 'OTHER');
-  assert.equal((await closeLibraryDay({ collection, at: at + 1000 })).reason, 'already_closed');
+  assert.equal((await closeLibraryDay({ collection, at: at + 1000, settings: {openTime:'07:00',closeTime:'22:00'} })).reason, 'already_closed');
   items.set('sgmUsers/u1', { ...baseUser }); // a late legacy client writes the stale link
-  const again = await closeLibraryDay({ collection, at: at + 3000 });
+  const again = await closeLibraryDay({ collection, at: at + 3000, settings: {openTime:'07:00',closeTime:'22:00'} });
   assert.equal(again.recovered, true);
   assert.equal(again.userCount, 1);
   assert.equal(items.get('sgmUsers/u1').activeDeskId, null);

@@ -10,7 +10,7 @@ export default function handler(req, res) {
     // Maintain the existing /api/version response and cache semantics.
     res.setHeader('Cache-Control', 'no-store');
     return res.status(200).json({
-      version: '2026.10.07.1',
+      version: '2026.11.18.1',
       commit: process.env.VERCEL_GIT_COMMIT_SHA || 'manual-upload'
     });
   }

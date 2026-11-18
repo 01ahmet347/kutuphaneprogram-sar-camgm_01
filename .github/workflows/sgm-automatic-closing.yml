@@ -1,0 +1,23 @@
+name: SGM otomatik kapanış (opsiyonel)
+on:
+  schedule:
+    # Istanbul saatine göre her 5 dakikada bir kontrol; sunucu saat ayarlarını okuyarak karar verir.
+    # Vercel Hobby gün başına bir cron ile sınırlıysa bu alternatif kullanılabilir.
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+jobs:
+  check-closing:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sunucuda kütüphane kapanışını kontrol et
+        env:
+          SGM_CRON_URL: ${{ secrets.SGM_CRON_URL }}
+          SGM_CRON_SECRET: ${{ secrets.SGM_CRON_SECRET }}
+        run: |
+          if [ -z "$SGM_CRON_URL" ] || [ -z "$SGM_CRON_SECRET" ]; then
+            echo 'SGM_CRON_URL ve SGM_CRON_SECRET Secrets ayarlanmalı.'
+            exit 1
+          fi
+          curl --fail --silent --show-error --max-time 50 --retry 2 \
+            --header "Authorization: Bearer $SGM_CRON_SECRET" \
+            "$SGM_CRON_URL"

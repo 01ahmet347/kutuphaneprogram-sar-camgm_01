@@ -58,7 +58,7 @@ export default async function handler(req, res) {
     if (action === 'assign') {
       const settingsSnapshot = await dataCollection('sgmConfig').doc('settings').get();
       const settings = settingsSnapshot.data() || {};
-      if (outsideLibraryHours(Date.now(), settings.openTime || '07:00')) return res.status(409).json({ ok: false, message: 'Kütüphane kapalıyken masa atanamaz.' });
+      if (outsideLibraryHours(Date.now(), settings.openTime || '07:00', settings.closeTime || '22:00')) return res.status(409).json({ ok: false, message: 'Kütüphane kapalıyken masa atanamaz.' });
       const firestore = dataCollection('sgmDesks').firestore;
       const actions = createCloudActions({
         db: firestore, runTransaction: (_db, callback) => firestore.runTransaction(callback),

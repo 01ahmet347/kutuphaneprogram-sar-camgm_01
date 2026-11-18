@@ -29,7 +29,7 @@ test('public /api/version URL is preserved with rewrite', () => {
   assert.ok(config.rewrites.some(r => r.source === '/api/version' && r.destination === '/api/server-time?route=version'));
   const response = request('GET', { route: 'version' });
   assert.equal(response.statusCode, 200);
-  assert.equal(response.body.version, '2026.10.07.1');
+  assert.equal(response.body.version, '2026.11.18.1');
   assert.ok(typeof response.body.commit === 'string');
   assert.equal(response.headers['Cache-Control'], 'no-store');
 });

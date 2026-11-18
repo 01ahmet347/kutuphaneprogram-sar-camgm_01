@@ -5,15 +5,16 @@ import { createCloudActions } from '../src/cloud-transactions.js';
 import { getIstanbulDayKey } from '../server/student-desk.js';
 import { approveAccounts, validApprovalIds, updateAdminAccount, restoreReportPermission } from '../server/user-approval.js';
 import { violationPolicyPatch } from '../src/restriction-policy.js';
+import { updateSystemSettings } from '../server/settings-update.js';
 
 export default async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store');
   if (req.method !== 'POST') return res.status(405).json({ ok: false });
   const { action, userId, userIds, deskId, patch, expectedPermission } = req.body || {};
-  if (!['delete_user', 'expire', 'approve_user', 'approve_users', 'update_user', 'restore_report_permission'].includes(action) ||
+  if (!['delete_user', 'expire', 'approve_user', 'approve_users', 'update_user', 'restore_report_permission','update_settings','close_history'].includes(action) ||
       action === 'approve_user' && !validApprovalIds([userId]) ||
       action === 'approve_users' && !validApprovalIds(userIds) ||
-      ['update_user','restore_report_permission'].includes(action) && !validApprovalIds([userId]) ||
+      ['update_user','restore_report_permission','update_settings','close_history'].includes(action) && !validApprovalIds([userId]) ||
       action === 'delete_user' && (typeof userId !== 'string' || !userId || userId.includes('/') || userId.length > 180) ||
       action === 'expire' && (!Number.isInteger(deskId) || deskId < 1 || deskId > 35)) {
     return res.status(400).json({ ok: false, message: 'Geçersiz işlem.' });
@@ -23,6 +24,17 @@ export default async function handler(req, res) {
     if (!token) return res.status(401).json({ ok: false });
     const admin = await getAuth(adminApp()).verifyIdToken(token);
     await requireActiveAdmin(admin);
+    if (action === 'update_settings') {
+      const result = await updateSystemSettings({
+        patch, collection: dataCollection,
+        runTransaction: callback => dataCollection('sgmConfig').firestore.runTransaction(callback)
+      });
+      return res.status(200).json({ ok: true, result });
+    }
+    if (action === 'close_history') {
+      const snapshot = await dataCollection('sgmDailyClosures').orderBy('closedAt', 'desc').limit(14).get();
+      return res.status(200).json({ ok: true, result: { history: snapshot.docs.map(doc => ({ day: doc.id, ...doc.data() })) } });
+    }
     if (action === 'approve_user' || action === 'approve_users') {
       const ids = action === 'approve_user' ? [userId] : userIds;
       const users = await approveAccounts({
@@ -70,7 +82,7 @@ export default async function handler(req, res) {
   } catch (error) {
     console.error('Admin maintenance error:', error.code || error.message);
     return res.status(error.status || 503).json({ ok: false, message:
-      error.status && action === 'update_user' ? error.message :
+      error.status && ['update_user','update_settings'].includes(action) ? error.message :
       error.status === 409 && (action === 'approve_user' || action === 'approve_users')
         ? 'Seçilen kullanıcılardan biri bulunamadı veya silinmiş. Listeyi yenileyin.'
         : 'Yönetici sunucu işlemi tamamlanamadı.' });

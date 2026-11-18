@@ -64,7 +64,7 @@ const handler = createStudentDeskHandler({
 
     return {
       ...actions,
-      closedNow: () => outsideLibraryHours(Date.now(), settings.openTime || '07:00'),
+      closedNow: () => outsideLibraryHours(Date.now(), settings.openTime || '07:00', settings.closeTime || '22:00'),
 
       cancel: ({ userId, deskId }) =>
         firestore.runTransaction(async tx => {
