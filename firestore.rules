@@ -1,0 +1,123 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isAdminFor(appId) {
+      return signedIn()
+        && request.auth.token.admin == true
+        && request.auth.token.adminSessionId is string
+        && exists(/databases/$(database)/documents/artifacts/$(appId)/public/data/sgmAdminSessions/active)
+        && get(/databases/$(database)/documents/artifacts/$(appId)/public/data/sgmAdminSessions/active).data.sessionId == request.auth.token.adminSessionId;
+    }
+
+    function isStudent(userId) {
+      return signedIn()
+        && request.auth.token.role == 'student'
+        && request.auth.uid == userId;
+    }
+
+    // Lider hesabı ve denetim belgelerine istemciden erişim yok: yalnızca Admin SDK API.
+    match /artifacts/{appId}/public/data/sgmLeaders/{id} { allow read, write: if false; }
+    match /artifacts/{appId}/public/data/sgmLeaderAudit/{id} { allow read, write: if false; }
+    match /artifacts/{appId}/public/data/sgmLeaderConfig/{id} { allow read, write: if false; }
+    match /artifacts/{appId}/public/data/sgmFormSubmissions/{id} { allow read, write: if false; }
+    match /artifacts/{appId}/public/data/sgmRegistrationEmails/{id} { allow read, write: if false; }
+    match /artifacts/{appId}/public/data/sgmFormEmails/{id} { allow read, write: if false; }
+    match /artifacts/{appId}/public/data/sgmActivities/{id} { allow read, write: if false; }
+    match /artifacts/{appId}/public/data/sgmActivityApplications/{id} { allow read, write: if false; }
+    match /artifacts/{appId}/public/data/sgmActivityAudit/{id} { allow read, write: if false; }
+    match /artifacts/{appId}/public/data/sgmLeaderLoginAttempts/{id} { allow read, write: if false; }
+
+    match /artifacts/{appId}/public/data/sgmConfig/{documentId} {
+      allow read: if signedIn();
+      allow write: if isAdminFor(appId);
+    }
+
+    // Mevcut oturum ve mola alanları yalnızca güvenilir Admin SDK API'leri
+    // üzerinden değişir. Eski açık YP sekmeleri artık bu alanları geri yazamaz.
+    function deskSessionMutation() {
+      return request.resource.data.diff(resource.data).affectedKeys().hasAny([
+        'status', 'occupant', 'ownerDeviceId', 'sessionStartTime',
+        'guestOccupant', 'guestSessionStartTime', 'guestBreakEndTime',
+        'guestReported', 'guestReportEndTime', 'guestReportIssuedAt',
+        'guestReportVerifiedAt', 'pendingOccupant', 'pendingDeskRole',
+        'pendingDeskDeadline', 'pendingDeviceId', 'breakEndTime',
+        'breakSessionId', 'breakStartedAt', 'breakType', 'breakOwnerId',
+        'breakDurationMinutes', 'activityId', 'activityExtraType', 'breakMergedType', 'reportEndTime', 'reportIssuedAt',
+        'reportVerifiedAt'
+      ]);
+    }
+
+    function userSessionMutation() {
+      return request.resource.data.diff(resource.data).affectedKeys().hasAny([
+        'activeDeskId', 'activeDeskRole', 'pendingDeskId',
+        'pendingDeskDeadline', 'adminDeskOverrideDeskId',
+        'adminDeskOverrideSessionStart', 'lastBreakSession', 'lastAutoBreakRelease',
+        'lastActiveTime', 'gmDeskAccessAt', 'deskReleasedAt', 'deskReclaimDeskId',
+        'deskReclaimAllowedAt', 'activityUsedDay', 'mergeDay', 'mergeCount'
+      ]);
+    }
+
+    // Yetkileri yalnızca yönetici token'ını doğrulayan sunucu API'si yazar.
+    // Gecikmiş bir yönetici sekmesi veya yerel senkron işlemi onayı geri alamaz.
+    function userAccountPermissionMutation() {
+      return request.resource.data.diff(resource.data).affectedKeys().hasAny([
+        'blocked', 'pendingApproval', 'restrictedUntil', 'restrictionReason',
+        'canReport', 'reportPermissionPolicyVersion', 'reportPermissionRestrictionUntil',
+        'reportPermissionRestoredAt', 'restrictionClearedAt',
+        'formGateEnabled', 'registrationFormStatus', 'formVerifiedAt', 'formInfoRestricted',
+        'formInfoRestrictionReason', 'formInfoRestrictionAt', 'formInfoRestrictionBy',
+        'leaderReviewStatus', 'leaderReviewedBy', 'leaderReviewedAt',
+        'verifiedEmailHash', 'formGateEmailRequired'
+      ]);
+    }
+
+    match /artifacts/{appId}/public/data/sgmDesks/{deskId} {
+      allow read: if signedIn();
+      allow create: if isAdminFor(appId) &&
+        request.resource.data.status == 'available' &&
+        request.resource.data.occupant == null;
+      allow update: if isAdminFor(appId) && !deskSessionMutation();
+      allow delete: if false;
+    }
+
+    match /artifacts/{appId}/public/data/sgmUsers/{userId} {
+      allow get: if isAdminFor(appId) || isStudent(userId);
+      allow list: if isAdminFor(appId);
+      allow create, delete: if isAdminFor(appId);
+      allow update: if isAdminFor(appId) && !userSessionMutation() && !userAccountPermissionMutation();
+    }
+
+    match /artifacts/{appId}/public/data/sgmMessages/{userId} {
+      allow get: if isAdminFor(appId) || isStudent(userId);
+      allow list: if isAdminFor(appId);
+      allow write: if isAdminFor(appId);
+    }
+
+    // Fallback kuralı özel API kontrolündeki koleksiyonların kurallarını aşamaz.
+    // Firestore üst üste eşleşen kuralları OR ile değerlendirir; bu istisna zorunludur.
+    function protectedApiCollection(bucket) {
+      return bucket in [
+        'sgmLeaders', 'sgmLeaderAudit', 'sgmLeaderConfig',
+        'sgmFormSubmissions', 'sgmLeaderLoginAttempts', 'sgmRegistrationEmails', 'sgmFormEmails',
+        'sgmActivities', 'sgmActivityApplications', 'sgmActivityAudit',
+        'sgmUsers', 'sgmDesks', 'sgmMessages', 'sgmConfig', 'sgmAdminSessions'
+      ];
+    }
+    match /artifacts/{appId}/public/data/sgmAdminSessions/{id} {
+      allow read: if isAdminFor(appId);
+      allow write: if false;
+    }
+    match /artifacts/{appId}/public/data/{collection}/{documentId} {
+      allow read, write: if isAdminFor(appId) && !protectedApiCollection(collection);
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
