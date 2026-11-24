@@ -1,0 +1,122 @@
+import { getAuth } from 'firebase-admin/auth';
+import { getFirestore } from 'firebase-admin/firestore';
+import { adminApp, dataCollection } from '../server/firebase-admin.js';
+import { createStudentDeskHandler, getIstanbulDayKey } from '../server/student-desk.js';
+import { createCloudActions } from '../src/cloud-transactions.js';
+import { outsideLibraryHours } from '../server/daily-close.js';
+import { violationPolicyPatch } from '../src/restriction-policy.js';
+import { releaseExpiredBreaksForDesk } from '../server/break-auto-release.js';
+
+const handler = createStudentDeskHandler({
+  autoReleaseBreak: deskId => releaseExpiredBreaksForDesk({ deskId, collection: dataCollection }),
+  async authenticateStudent(req) {
+    const token = /^Bearer\s+(.+)$/i.exec(
+      req.headers?.authorization || ''
+    )?.[1];
+
+    if (!token) return null;
+
+    const decoded = await getAuth(adminApp()).verifyIdToken(token);
+
+    return decoded.role === 'student' ? decoded.uid : null;
+  },
+
+  async createActions() {
+    const app = adminApp();
+    const firestore = getFirestore(app);
+
+    const settingsSnapshot = await dataCollection('sgmConfig')
+      .doc('settings')
+      .get();
+
+    const settings = settingsSnapshot.data() || {};
+
+    const ref = (bucket, id) =>
+      dataCollection(bucket).doc(String(id));
+
+    const dayKey = at =>
+      getIstanbulDayKey(at ? new Date(at) : new Date());
+
+    // Arayüz ve sunucu aynı hesap kısıtlarını kontrol eder.
+    const isRestricted = (user, at = Date.now()) =>
+      user?.formInfoRestricted === true ||
+      user?.blocked === true ||
+      user?.pendingApproval === true ||
+      Number(user?.restrictedUntil || 0) > at;
+
+    const lostDeskToday = (user, deskId) =>
+      user?.lostDeskDate === dayKey() &&
+      (user?.lostDeskIds || []).includes(Number(deskId));
+
+    const applyViolationPolicy = (user, deskId, at) =>
+      violationPolicyPatch(user, deskId, at, dayKey);
+
+    const actions = createCloudActions({
+      db: firestore,
+      runTransaction: (_db, callback) =>
+        firestore.runTransaction(callback),
+      ref,
+      settings: () => settings,
+      dayKey,
+      isRestricted,
+      lostDeskToday,
+      applyViolationPolicy
+    });
+
+    return {
+      ...actions,
+      closedNow: () => outsideLibraryHours(Date.now(), settings.openTime || '07:00', settings.closeTime || '22:00'),
+
+      cancel: ({ userId, deskId }) =>
+        firestore.runTransaction(async tx => {
+          const userRef = ref('sgmUsers', userId);
+          const deskRef = ref('sgmDesks', deskId);
+
+          const [userSnapshot, deskSnapshot] = await Promise.all([
+            tx.get(userRef),
+            tx.get(deskRef)
+          ]);
+
+          if (!userSnapshot.exists || !deskSnapshot.exists) {
+            throw new Error('Rezervasyon bulunamadı.');
+          }
+
+          const user = userSnapshot.data();
+          const desk = deskSnapshot.data();
+
+          if (
+            desk.pendingOccupant !== userId ||
+            Number(user.pendingDeskId) !== Number(deskId)
+          ) {
+            throw new Error(
+              'Bu masa için iptal edilebilir rezervasyonunuz yok.'
+            );
+          }
+
+          const nextDesk = {
+            ...desk,
+            pendingOccupant: null,
+            pendingDeskRole: null,
+            pendingDeskDeadline: null,
+            pendingDeviceId: null
+          };
+
+          const nextUser = {
+            ...user,
+            pendingDeskId: null,
+            pendingDeskDeadline: null
+          };
+
+          tx.set(deskRef, nextDesk);
+          tx.set(userRef, nextUser);
+
+          return {
+            desk: nextDesk,
+            user: nextUser
+          };
+        })
+    };
+  }
+});
+
+export default handler;
